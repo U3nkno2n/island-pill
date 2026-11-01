@@ -1,0 +1,1973 @@
+#!/usr/bin/env python3
+"""
+Island - a tiny Dynamic Island for Linux Mint (Cinnamon / X11).
+
+One black, detached pill at the top centre of the screen. It appears for active music or
+downloads and disappears when both activities end. Set STYLE = "notch" only if you prefer
+a shape that hangs from the screen edge.
+
+  hidden     fully transparent at rest, leaving only an invisible hover zone near the top edge
+  active     appears while music plays or a download is active; charger connection gets a
+             brief animated battery flash, then hides again. Hover expands the island.
+  peek       slides out for a few seconds on: new notification, track change,
+             charger plugged / unplugged, low battery, timer finished,
+             Bluetooth device connected / disconnected, Wi-Fi connected / disconnected,
+             download finished
+  open       hover (or click) the pill: media controls, CPU / RAM / temperature,
+             battery, 5 / 10 / 25 minute timers, a Wi-Fi button (network name and signal;
+             tap to switch Wi-Fi on/off), a Bluetooth button (shows the connected device
+             and its battery; tap to switch Bluetooth on/off), and, only while a download
+             runs, a download row (file name, speed, bar)
+
+Why it is light: no web view and no extra libraries (only GTK3 + cairo, which
+Mint already ships). Music, battery, Bluetooth, Wi-Fi and notifications arrive as D-Bus
+signals. The only wake-ups while idle are the clock (once a minute) and a tiny read of
+/proc/net/dev every 2 seconds to notice downloads (SHOW_DOWNLOADS = False removes it).
+Animation frames only run while the pill is actually moving.
+
+Right-click the pill for the Quit menu.
+"""
+import fcntl
+import html
+import math
+import os
+import re
+import signal
+import subprocess
+import sys
+import time
+
+# Keep GTK from loading things this widget never uses: the accessibility bridge, GTK modules,
+# and GDK's OpenGL setup (it pulls in Mesa and LLVM, roughly 50 MB, and we only draw with cairo).
+os.environ.setdefault("NO_AT_BRIDGE", "1")
+os.environ["GTK_MODULES"] = ""
+os.environ["GDK_GL"] = "disable"
+
+import gi
+
+gi.require_version("Gtk", "3.0")
+gi.require_version("Gdk", "3.0")
+gi.require_version("Pango", "1.0")
+gi.require_version("PangoCairo", "1.0")
+from gi.repository import Gdk, Gio, GLib, Gtk, Pango, PangoCairo  # noqa: E402
+import cairo  # noqa: E402
+
+# ---- settings you may want to change ---------------------------------------
+HOUR24 = False            # False: 10:24 PM    True: 22:24
+STYLE = os.environ.get("ISLAND_PILL_STYLE", "pill")
+#   "pill":  a detached, floating pill with a gap above it (default)
+#   "notch": hangs from the very top edge with flared corners
+FONT = "Sans"
+TIMER_PRESETS = (5, 10, 25)   # minutes, shown as buttons in the open view
+PEEK_SECONDS = 4          # how long a peek stays out
+HOVER_OPEN_DELAY_MS = 5000 # hover this long before opening the full controls; click opens instantly
+SHOW_NOTIFICATIONS = True # peek on desktop notifications
+LOW_BATTERY = (20, 10)    # warn when the battery falls below these percentages
+SHOW_DOWNLOADS = True     # speed + progress bar while something downloads (False: no polling at all)
+DOWNLOAD_MIN_KBPS = 1200  # fallback threshold, KB/s; used only if network fallback is enabled
+DOWNLOAD_NETWORK_FALLBACK = False  # avoids mistaking video/music streaming for file downloads
+DOWNLOAD_DONE_PEEK = True # peek "Download finished" when a download of 20 MB or more ends
+SHOW_WIFI = True          # Wi-Fi button in the open card, peek on connect / disconnect
+HOVER_ONLY = True         # keep the island visually quiet; reveal/expand content only on hover
+HOVER_ONLY_PEEKS = True   # allow brief peeks (battery, downloads, Wi-Fi, etc.) even in quiet mode
+# -----------------------------------------------------------------------------
+
+NOTCH = STYLE != "pill"
+TOP_MARGIN = 0 if NOTCH else 8   # visible gap between screen edge and floating pill (px)
+EAR = 12                         # radius of the flared top corners (notch style)
+IDLE_H = 30 if NOTCH else 34
+DL_EXTRA = 6                     # extra idle height while the download bar is showing (px)
+PEEK_W, PEEK_H = 360, 58
+OPEN_W = 400
+OPEN_H_BASE = 148                # media / clock, stats and timer rows
+ROW_CONN_H = 34                  # Wi-Fi + Bluetooth row (only if either exists)
+ROW_DL_H = 40                    # download row (only while downloading)
+OPEN_H_MAX = OPEN_H_BASE + ROW_CONN_H + ROW_DL_H
+WIN_W = OPEN_W + 60
+WIN_H = TOP_MARGIN + OPEN_H_MAX + 8
+NET_POLL_SECONDS = 0.5           # faster samples make speed and activity detection more responsive
+DOWNLOAD_CONFIRM_SAMPLES = 4     # 4 x 0.5 s ~= 2 s confirmation window
+DONE_MIN_BYTES = 20 * 1048576    # smaller downloads finish without a "finished" peek
+PARTIAL_EXT = (".part", ".crdownload", ".opdownload", ".download")   # browsers' unfinished files
+
+WHITE = (1, 1, 1, 1)
+DIM = (1, 1, 1, 0.55)
+FAINT = (1, 1, 1, 0.12)
+GREEN = (0.20, 0.84, 0.45, 1)
+ORANGE = (1.0, 0.62, 0.10, 1)
+BLUE = (0.35, 0.62, 1.0, 1)
+BLACK = (0, 0, 0, 1) if NOTCH else (0.02, 0.02, 0.02, 1)
+
+MPRIS = "org.mpris.MediaPlayer2"
+MPRIS_PATH = "/org/mpris/MediaPlayer2"
+MPRIS_PLAYER = "org.mpris.MediaPlayer2.Player"
+
+NM = "org.freedesktop.NetworkManager"
+NM_PATH = "/org/freedesktop/NetworkManager"
+
+
+# ---------------------------------------------------------------- drawing ----
+def rounded_rect(cr, x, y, w, h, r):
+    r = max(0.0, min(r, w / 2.0, h / 2.0))
+    cr.new_sub_path()
+    cr.arc(x + w - r, y + r, r, -math.pi / 2, 0)
+    cr.arc(x + w - r, y + h - r, r, 0, math.pi / 2)
+    cr.arc(x + r, y + h - r, r, math.pi / 2, math.pi)
+    cr.arc(x + r, y + r, r, math.pi, 1.5 * math.pi)
+    cr.close_path()
+
+
+def shape_path(cr, x, y, w, h):
+    """Outline of the island: a notch hanging from the top edge, or a floating pill."""
+    if not NOTCH:
+        rounded_rect(cr, x, y, w, h, min(h / 2.0, 28))
+        return
+    rb = max(0.0, min(h * 0.4, 24.0, w / 2.0))   # rounded bottom corners
+    re = max(0.0, min(EAR, h - rb))              # flared "ears" where it meets the edge
+    cr.new_sub_path()
+    cr.move_to(x - re, y)
+    cr.arc(x - re, y + re, re, -math.pi / 2, 0)
+    cr.line_to(x, y + h - rb)
+    cr.arc_negative(x + rb, y + h - rb, rb, math.pi, math.pi / 2)
+    cr.line_to(x + w - rb, y + h)
+    cr.arc_negative(x + w - rb, y + h - rb, rb, math.pi / 2, 0)
+    cr.line_to(x + w, y + re)
+    cr.arc(x + w + re, y + re, re, math.pi, 1.5 * math.pi)
+    cr.close_path()
+
+
+_scratch = None
+
+
+def _layout(cr, s, size, bold, width=None):
+    lay = PangoCairo.create_layout(cr)
+    lay.set_font_description(
+        Pango.FontDescription("%s %s%s" % (FONT, "Bold " if bold else "", size)))
+    lay.set_single_paragraph_mode(True)
+    lay.set_text(s, -1)
+    if width is not None:
+        lay.set_width(int(width * Pango.SCALE))
+        lay.set_ellipsize(Pango.EllipsizeMode.END)
+    return lay
+
+
+def measure(s, size, bold=False):
+    global _scratch
+    if _scratch is None:
+        _scratch = cairo.Context(cairo.ImageSurface(cairo.FORMAT_A8, 1, 1))
+    return _layout(_scratch, s, size, bold).get_pixel_size()[0]
+
+
+_dl_seg = None
+
+
+def dl_seg_width():
+    """Width of the download part of the idle pill: arrow + the widest speed text."""
+    global _dl_seg
+    if _dl_seg is None:
+        _dl_seg = 16 + measure("88.8 MB/s", 9.5, True)
+    return _dl_seg
+
+
+def draw_text(cr, s, x, cy, size, color, bold=False, width=None, align=0):
+    """Draw one line of text vertically centred on cy. align: 0 left, 1 centre, 2 right."""
+    lay = _layout(cr, s, size, bold, width)
+    tw, th = lay.get_pixel_size()
+    if align == 1:
+        x -= tw / 2.0
+    elif align == 2:
+        x -= tw
+    cr.move_to(x, cy - th / 2.0)
+    cr.set_source_rgba(*color)
+    PangoCairo.show_layout(cr, lay)
+    return tw
+
+
+def glyph_tri(cr, cx, cy, s, d=1):
+    cr.move_to(cx - d * s * 0.45, cy - s * 0.6)
+    cr.line_to(cx + d * s * 0.65, cy)
+    cr.line_to(cx - d * s * 0.45, cy + s * 0.6)
+    cr.close_path()
+    cr.fill()
+
+
+def glyph_skip(cr, cx, cy, s, d=1):
+    glyph_tri(cr, cx - d * s * 0.25, cy, s * 0.9, d)
+    cr.rectangle(cx + d * s * 0.5 - 1.2, cy - s * 0.55, 2.4, s * 1.1)
+    cr.fill()
+
+
+def glyph_pause(cr, cx, cy, s):
+    cr.rectangle(cx - s * 0.5, cy - s * 0.6, s * 0.34, s * 1.2)
+    cr.rectangle(cx + s * 0.16, cy - s * 0.6, s * 0.34, s * 1.2)
+    cr.fill()
+
+
+def draw_bars(cr, x, cy, color, phase=0.0):
+    """Three compact equalizer bars with a gentle, phase-driven music animation."""
+    cr.set_source_rgba(*color)
+    for i, base in enumerate((6, 11, 8)):
+        hh = 4.0 + 7.0 * (0.5 + 0.5 * math.sin(phase + i * 1.65))
+        cr.rectangle(x + i * 4.5, cy - hh / 2.0, 2.5, hh)
+    cr.fill()
+
+
+def draw_battery(cr, x, cy, pct, charging, color, pulse=1.0):
+    w, h = 20.0, 10.0
+    cr.set_line_width(1)
+    cr.set_source_rgba(1, 1, 1, 0.75)
+    rounded_rect(cr, x + 0.5, cy - h / 2, w, h, 2.5)
+    cr.stroke()
+    cr.rectangle(x + w + 1.5, cy - 2, 1.8, 4)
+    cr.fill()
+    cr.set_source_rgba(*color)
+    rounded_rect(cr, x + 2, cy - h / 2 + 1.5, max(1.5, (w - 3) * pct / 100.0), h - 3, 1.2)
+    cr.fill()
+    if charging:
+        cr.set_source_rgba(0, 0, 0, 0.45 + 0.45 * max(0.0, min(1.0, pulse)))
+        bx, by = x + w / 2 + 0.5, cy
+        cr.move_to(bx + 1.5, by - 4)
+        for dx, dy in ((-2.5, 1), (0, 1), (-1.5, 4), (2.5, -1), (0, -1)):
+            cr.line_to(bx + dx, by + dy)
+        cr.close_path()
+        cr.fill()
+
+
+def draw_clock_icon(cr, cx, cy, r, color):
+    cr.set_source_rgba(*color)
+    cr.set_line_width(1.8)
+    cr.arc(cx, cy, r, 0, 2 * math.pi)
+    cr.stroke()
+    cr.move_to(cx, cy - r * 0.6)
+    cr.line_to(cx, cy)
+    cr.line_to(cx + r * 0.45, cy + r * 0.3)
+    cr.stroke()
+
+
+def draw_bt_glyph(cr, cx, cy, color, s=0.85):
+    """The Bluetooth rune, about 12 px tall at s=1."""
+    pts = ((-3.5, -3.5), (3.5, 3.5), (0, 6.5), (0, -6.5), (3.5, -3.5), (-3.5, 3.5))
+    cr.set_source_rgba(*color)
+    cr.set_line_width(1.5)
+    cr.set_line_join(cairo.LINE_JOIN_ROUND)
+    cr.set_line_cap(cairo.LINE_CAP_ROUND)
+    cr.move_to(cx + pts[0][0] * s, cy + pts[0][1] * s)
+    for px, py in pts[1:]:
+        cr.line_to(cx + px * s, cy + py * s)
+    cr.stroke()
+
+
+def draw_wifi_glyph(cr, cx, cy, color, level=3):
+    """Wi-Fi fan, about 14 px wide. level 0-3 = how many arcs are lit."""
+    cr.save()
+    oy = cy + 4.5
+    cr.set_line_width(1.6)
+    cr.set_line_cap(cairo.LINE_CAP_ROUND)
+    for i, r in enumerate((3.4, 6.6, 9.8)):
+        cr.set_source_rgba(color[0], color[1], color[2], color[3] * (1.0 if i < level else 0.28))
+        cr.new_sub_path()
+        cr.arc(cx, oy, r, math.radians(225), math.radians(315))
+        cr.stroke()
+    cr.set_source_rgba(*color)
+    cr.arc(cx, oy, 1.3, 0, 2 * math.pi)
+    cr.fill()
+    cr.restore()
+
+
+def draw_down_arrow(cr, cx, cy, color, s=1.0):
+    """A downward arrow, about 9 px tall at s=1."""
+    cr.save()
+    cr.set_source_rgba(*color)
+    cr.set_line_width(1.7 * s)
+    cr.set_line_cap(cairo.LINE_CAP_ROUND)
+    cr.set_line_join(cairo.LINE_JOIN_ROUND)
+    cr.move_to(cx, cy - 4.5 * s)
+    cr.line_to(cx, cy + 4 * s)
+    cr.stroke()
+    cr.move_to(cx - 3.5 * s, cy + 0.5 * s)
+    cr.line_to(cx, cy + 4.3 * s)
+    cr.line_to(cx + 3.5 * s, cy + 0.5 * s)
+    cr.stroke()
+    cr.restore()
+
+
+def progress_bar(cr, x, y, w, h, frac, color):
+    cr.set_source_rgba(1, 1, 1, 0.14)
+    rounded_rect(cr, x, y, w, h, h / 2.0)
+    cr.fill()
+    if frac > 0:
+        cr.set_source_rgba(*color)
+        rounded_rect(cr, x, y, max(float(h), w * min(1.0, frac)), h, h / 2.0)
+        cr.fill()
+
+
+
+def indeterminate_bar(cr, x, y, w, h, phase, color):
+    """Draw a moving segment instead of a fake completion percentage."""
+    cr.set_source_rgba(1, 1, 1, 0.14)
+    rounded_rect(cr, x, y, w, h, h / 2.0)
+    cr.fill()
+    seg = max(18.0, w * 0.24)
+    travel = max(0.0, w - seg)
+    sx = x + travel * phase
+    cr.save()
+    cr.rectangle(x, y, w, h)
+    cr.clip()
+    cr.set_source_rgba(*color)
+    rounded_rect(cr, sx, y, seg, h, h / 2.0)
+    cr.fill()
+    cr.restore()
+
+def fmt_mmss(secs):
+    return "%d:%02d" % (secs // 60, secs % 60)
+
+
+def fmt_rate(bps):
+    if bps >= 104857600:
+        return "%d MB/s" % int(bps / 1048576.0)
+    if bps >= 1048576:
+        return "%.1f MB/s" % (bps / 1048576.0)
+    return "%d KB/s" % int(bps / 1024)
+
+
+def fmt_size(n):
+    if n >= 1073741824:
+        return "%.1f GB" % (n / 1073741824.0)
+    if n >= 1048576:
+        return "%d MB" % int(n / 1048576)
+    return "%d KB" % int(n / 1024)
+
+
+def clock_text():
+    if HOUR24:
+        return time.strftime("%H:%M")
+    return time.strftime("%I:%M %p").lstrip("0")
+
+
+def play_alarm():
+    wav = "/usr/share/sounds/freedesktop/stereo/alarm-clock-elapsed.oga"
+    cmds = []
+    if os.path.exists(wav):
+        cmds.append(["paplay", wav])
+    cmds.append(["canberra-gtk-play", "-i", "alarm-clock-elapsed"])
+    for cmd in cmds:
+        try:
+            subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            return
+        except OSError:
+            continue
+    Gdk.beep()
+
+
+# ------------------------------------------------------------ system stats ----
+def read_cpu():
+    with open("/proc/stat") as f:
+        v = [int(x) for x in f.readline().split()[1:9]]
+    return v[3] + v[4], sum(v)  # idle, total
+
+
+def read_mem():
+    total = avail = 0
+    with open("/proc/meminfo") as f:
+        for line in f:
+            if line.startswith("MemTotal:"):
+                total = int(line.split()[1])
+            elif line.startswith("MemAvailable:"):
+                avail = int(line.split()[1])
+                break
+    return (total - avail) / 1048576.0, total / 1048576.0  # GiB used, total
+
+
+def find_temp_file():
+    best = None
+    try:
+        for d in sorted(os.listdir("/sys/class/hwmon")):
+            base = "/sys/class/hwmon/" + d
+            try:
+                with open(base + "/name") as f:
+                    name = f.read().strip()
+            except OSError:
+                continue
+            f = base + "/temp1_input"
+            if name in ("k10temp", "coretemp", "zenpower") and os.path.exists(f):
+                return f
+            if name in ("acpitz", "cpu_thermal") and os.path.exists(f) and best is None:
+                best = f
+    except OSError:
+        pass
+    return best
+
+
+def read_temp(path):
+    if not path:
+        return None
+    try:
+        with open(path) as f:
+            return int(f.read()) / 1000.0
+    except (OSError, ValueError):
+        return None
+
+
+def net_ifaces():
+    """Physical network interfaces only. Loopback, bridges, docker and VPN tunnels are virtual
+    (their traffic also crosses a physical interface, so counting them would double it)."""
+    out = []
+    try:
+        for n in os.listdir("/sys/class/net"):
+            if "/virtual/" not in os.path.realpath("/sys/class/net/" + n):
+                out.append(n)
+    except OSError:
+        pass
+    return out
+
+
+def read_net_rx(names):
+    """Bytes received so far on the given interfaces."""
+    total = 0
+    with open("/proc/net/dev") as f:
+        for line in f.readlines()[2:]:
+            name, _, rest = line.partition(":")
+            if name.strip() in names:
+                total += int(rest.split()[0])
+    return total
+
+
+def download_dir():
+    home = os.path.expanduser("~")
+    try:
+        with open(os.path.join(home, ".config", "user-dirs.dirs")) as f:
+            for line in f:
+                if line.startswith("XDG_DOWNLOAD_DIR"):
+                    p = line.split("=", 1)[1].strip().strip('"').replace("$HOME", home)
+                    if p:
+                        return p
+    except OSError:
+        pass
+    return os.path.join(home, "Downloads")
+
+
+def find_partial(dirpath):
+    """Newest unfinished browser download (.part / .crdownload ...) touched in the last 8 s."""
+    best = None
+    now = time.time()
+    try:
+        with os.scandir(dirpath) as it:
+            for e in it:
+                if e.name.endswith(PARTIAL_EXT):
+                    try:
+                        mt = e.stat().st_mtime
+                    except OSError:
+                        continue
+                    if now - mt < 8 and (best is None or mt > best[1]):
+                        best = (e.name, mt)
+    except OSError:
+        return None
+    return os.path.splitext(best[0])[0] if best else None
+
+
+# ------------------------------------------------------------------ island ----
+class Island(Gtk.Window):
+    def __init__(self):
+        super().__init__(type=Gtk.WindowType.TOPLEVEL)
+        self.set_title("Island")
+        self.set_decorated(False)
+        self.set_resizable(False)
+        self.set_skip_taskbar_hint(True)
+        self.set_skip_pager_hint(True)
+        self.set_keep_above(True)
+        self.set_accept_focus(False)
+        self.set_focus_on_map(False)
+        self.set_type_hint(Gdk.WindowTypeHint.DOCK)
+        self.set_app_paintable(True)
+        self.set_size_request(WIN_W, WIN_H)
+        self.stick()
+        screen = self.get_screen()
+        visual = screen.get_rgba_visual()
+        if visual is not None:
+            self.set_visual(visual)
+        self.composited = visual is not None and screen.is_composited()
+        self.add_events(Gdk.EventMask.ENTER_NOTIFY_MASK | Gdk.EventMask.LEAVE_NOTIFY_MASK
+                        | Gdk.EventMask.BUTTON_PRESS_MASK)
+
+        # state
+        self.open = False
+        self.pointer_inside = False
+        self.music_phase = 0.0
+        self.charge_flash = False
+        self.charge_flash_id = 0
+        self.peek = {}
+        self.peek_on = False
+        self.hits = []
+        self.timer_end = None
+        self.timer_mins = 0
+        self.players = {}
+        self.batt_pct = None
+        self.batt_state = None
+        self.cpu_pct = None
+        self.cpu_prev = None
+        self.mem_used = None      # GiB used, cached once per second while open
+        self.mem_total = None     # GiB total, cached once per second while open
+        self.temp_cached = None   # Celsius, cached once per second while open
+        self.temp_file = find_temp_file()
+        self.last_notif = ("", 0.0)
+        self._ids = {"open": 0, "close": 0, "peek": 0, "sec": 0}
+        self.pending_peek = None      # peek queued while the expanded card is open
+        self.bus = None
+        self.upower = None
+        self.mon_conn = None
+        self.sysbus = None
+        self.bt_adapter = None   # object path of the Bluetooth adapter, if BlueZ is running
+        self.bt_powered = None   # None = no Bluetooth available
+        self.bt_dev = {}         # device path -> {"name", "connected", "battery"}
+        self.bt_note = ""        # short message shown on the Bluetooth button (e.g. "Blocked")
+        self.nm = None           # NetworkManager proxy (Wi-Fi)
+        self.wdev = None         # Wi-Fi device proxies (None = no Wi-Fi hardware)
+        self.wdev_wl = None
+        self.wap = None          # proxy of the access point we are connected to
+        self.wap_path = ""
+        self._wifi_find_in_flight = False   # async GetDevices discovery guard
+        self._wifi_device_paths = []
+        self._wifi_device_index = 0
+        self.wifi_on = None      # None = NetworkManager not running
+        self.wifi_hw = True      # False = hardware / rfkill switch is off
+        self.wifi_state = 0      # NetworkManager device state; 100 = connected
+        self.wifi_ssid = ""
+        self.wifi_strength = 0
+        self.wifi_up = False
+        self.wifi_seen = ""      # last network we were connected to (for the "disconnected" peek)
+        self.wifi_note = ""
+        self.wifi_sig = None
+        self.net_ifs = set()     # physical interfaces counted for download detection
+        self.net_prev = None     # (time, received bytes) at the previous sample
+        self.net_polls = 0
+        self.dl_dir = download_dir()
+        self.dl_active = False
+        self.dl_rate = None      # smoothed bytes per second
+        self.dl_peak = 0.0
+        self.dl_phase = 0.0          # moving indeterminate-bar phase when no real percentage exists
+        self.dl_phase_dir = 1.0
+        self.charge_phase = 0.0      # subtle lightning-bolt pulse while charging
+        self.visual_id = 0            # 30 fps redraw only while a visual transition is active
+        self.batt_draw_pct = None     # animated battery percentage shown by the renderer
+        self.batt_target_pct = None
+        self.dl_bytes = 0        # received since the download started
+        self.dl_pending = 0      # received while deciding whether it is a download
+        self.dl_hits = 0
+        self.dl_lows = 0
+        self.dl_name = ""
+        self.dl_source = ""       # "partial", "reported", or "network"
+        self.progress = {}       # app uri -> (fraction, time), from apps that report progress
+
+        # geometry (animated)
+        initial_w, initial_h = self.target()
+        self.w, self.h = float(initial_w), float(initial_h)
+        self.vw = self.vh = 0.0
+        self.tick_id = 0
+        self.last_t = 0.0
+
+        self.connect("draw", self.on_draw)
+        self.connect("realize", lambda *_: self.update_shape())
+        self.connect("enter-notify-event", self.on_enter)
+        self.connect("leave-notify-event", self.on_leave)
+        self.connect("button-press-event", self.on_press)
+        screen.connect("monitors-changed", lambda *_: self.place())
+        self.place()
+
+        self.schedule_clock()
+        # Defer blocking D-Bus / system initialisation to the idle loop so the
+        # window appears immediately. The main loop must be running for this.
+        self._initialized = False
+        GLib.idle_add(self.deferred_init)
+
+    def deferred_init(self):
+        """Run blocking D-Bus and system discovery after the window is visible."""
+        if self._initialized:
+            return GLib.SOURCE_REMOVE
+        self._initialized = True
+        try:
+            self.bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+            self.init_mpris()
+            if SHOW_DOWNLOADS:
+                self.init_progress_sources()
+            if SHOW_NOTIFICATIONS:
+                self.init_notifications()
+        except GLib.Error as e:
+            print("island: session bus unavailable:", e.message, file=sys.stderr)
+        self.init_battery()
+        self.init_bluetooth()
+        if SHOW_WIFI:
+            self.init_wifi()
+        if SHOW_DOWNLOADS:
+            self.init_downloads()
+        return GLib.SOURCE_REMOVE
+
+    # ---- placement / shape
+    def place(self):
+        display = Gdk.Display.get_default()
+        mon = display.get_primary_monitor() or display.get_monitor(0)
+        if mon is None:
+            return
+        g = mon.get_geometry()
+        self.move(g.x + (g.width - WIN_W) // 2, g.y)
+
+    def pill_rect(self):
+        return (WIN_W - self.w) / 2.0, float(TOP_MARGIN), self.w, self.h
+
+    def activity_visible(self):
+        # Keep the island visible for active music/downloads, or briefly for a charger event.
+        return self.media_playing() or self.dl_active or self.charge_flash
+
+    def update_shape(self):
+        gw = self.get_window()
+        if gw is None:
+            return
+        x, y, w, h = self.pill_rect()
+        if HOVER_ONLY and not self.pointer_inside and not self.peek_on and not self.activity_visible():
+            # Invisible but hoverable hit-zone at the top edge, centred over the camera/notch.
+            rect = cairo.RectangleInt((WIN_W - 180) // 2, 0, 180, 8)
+        else:
+            # The pill plus a narrow strip above it lets the pointer reach the top edge.
+            rect = cairo.RectangleInt(int(x), 0, int(math.ceil(w)), int(math.ceil(y + h)))
+        gw.input_shape_combine_region(cairo.Region(rect), 0, 0)
+        if not self.composited:
+            surf = cairo.ImageSurface(cairo.FORMAT_A1, WIN_W, WIN_H)
+            c = cairo.Context(surf)
+            c.set_antialias(cairo.ANTIALIAS_NONE)
+            if not (HOVER_ONLY and not self.pointer_inside and not self.peek_on and not self.activity_visible()):
+                shape_path(c, x, y, w, h)
+                c.fill()
+            gw.shape_combine_region(Gdk.cairo_region_create_from_surface(surf), 0, 0)
+
+    # ---- sizes / animation
+    def idle_activity(self):
+        """Compact text shown in the floating pill while music or a download is active.
+        Downloads take priority if both happen at once; the hover-open card still shows both."""
+        if self.dl_active:
+            return "download", self.dl_name or "Downloading"
+        cur = self.current_player() if self.media_playing() else None
+        if cur:
+            return "music", cur[1].get("title") or cur[1].get("artist") or "Now playing"
+        return "", ""
+
+    def idle_w(self, dl):
+        kind, label = self.idle_activity()
+        if kind:
+            # Expand horizontally just enough for a useful filename/title, but never into
+            # the tall hover card. The renderer ellipsizes unusually long names.
+            icon_w = 18 if kind == "music" else 17
+            label_w = min(310, measure(label, 10.5, True))
+            return max(112, min(360, int(round(label_w + icon_w + 34))))
+        if self.timer_end is not None or HOUR24:
+            tmpl = "88:88"
+        else:
+            tmpl = "88:88 PM"
+        return max(96, int(round(measure(tmpl, 10.5, True) + 40)))
+
+    def idle_target_w(self):
+        return self.idle_w(self.dl_active)
+
+    def idle_target_h(self):
+        return IDLE_H + (DL_EXTRA if self.dl_active else 0)
+
+    def has_conn(self):
+        return self.wdev is not None or self.bt_powered is not None
+
+    def open_h(self):
+        return (OPEN_H_BASE + (ROW_CONN_H if self.has_conn() else 0)
+                + (ROW_DL_H if self.dl_active else 0))
+
+    def target(self):
+        if self.open:
+            return OPEN_W, self.open_h()
+        if self.peek_on:
+            return PEEK_W, PEEK_H
+        if HOVER_ONLY and not self.pointer_inside and not self.activity_visible():
+            return 1, 1
+        if HOVER_ONLY and not self.pointer_inside:
+            return self.idle_target_w(), self.idle_target_h()
+        return self.idle_target_w(), self.idle_target_h()
+
+    def retarget(self):
+        if not self.get_mapped():
+            self.w, self.h = [float(v) for v in self.target()]
+            return
+        if not self.tick_id:
+            self.last_t = 0.0
+            self.tick_id = self.add_tick_callback(self.on_tick)
+
+    def on_tick(self, widget, clock):
+        t = clock.get_frame_time() / 1e6
+        dt = min(t - self.last_t, 1 / 30.0) if self.last_t else 1 / 60.0
+        self.last_t = t
+        tw, th = self.target()
+        settled = True
+        k, d = 220.0, 31.0  # softer damped spring for a smoother, less snappy resize
+        for name, tgt in (("w", tw), ("h", th)):
+            cur, v = getattr(self, name), getattr(self, "v" + name)
+            v += (k * (tgt - cur) - d * v) * dt
+            cur += v * dt
+            if abs(tgt - cur) < 0.3 and abs(v) < 2.0:
+                cur, v = float(tgt), 0.0
+            else:
+                settled = False
+            setattr(self, name, max(8.0, cur))
+            setattr(self, "v" + name, v)
+        self.update_shape()
+        self.queue_draw()
+        if settled:
+            self.tick_id = 0
+            return GLib.SOURCE_REMOVE
+        return GLib.SOURCE_CONTINUE
+
+    # ---- small timer helpers
+    def _cancel(self, key):
+        if self._ids[key]:
+            GLib.source_remove(self._ids[key])
+            self._ids[key] = 0
+
+    # ---- open / close / peek
+    def set_open(self, value):
+        if value == self.open:
+            return
+        self.open = value
+        if value:
+            self.peek_on = False
+            self.pending_peek = None   # a stale queued peek is not shown over an open card
+            self._cancel("peek")
+            try:
+                self.cpu_prev = read_cpu()
+            except OSError:
+                self.cpu_prev = None
+            self.ensure_sec()
+        else:
+            self.hits = []
+            pending = self.pending_peek
+            self.pending_peek = None
+            if pending:
+                self.show_peek(
+                    pending["kind"],
+                    pending["title"],
+                    pending.get("body", ""),
+                    secs=pending.get("secs", PEEK_SECONDS),
+                    accent=pending.get("accent"),
+                    app=pending.get("app", ""),
+                )
+        self.retarget()
+        self.queue_draw()
+
+    def show_peek(self, kind, title, body="", secs=PEEK_SECONDS, accent=None, app=""):
+        if self.open:
+            # The expanded card is showing: queue the event so it can surface
+            # when the card closes instead of being silently discarded.
+            self.pending_peek = {
+                "kind": kind,
+                "title": title,
+                "body": body,
+                "secs": secs,
+                "accent": accent,
+                "app": app,
+            }
+            return
+        if not HOVER_ONLY_PEEKS:
+            return
+        self.peek = dict(kind=kind, title=title, body=body, accent=accent, app=app)
+        self.peek_on = True
+        self._cancel("peek")
+        self._ids["peek"] = GLib.timeout_add(int(secs * 1000), self._peek_timeout)
+        self.retarget()
+        self.queue_draw()
+
+    def end_peek(self):
+        """Dismiss the current peek now (a click). Also stops its timer, so a stale timer
+        can't cut short the next peek."""
+        self._cancel("peek")
+        self.peek_on = False
+        self.retarget()
+        self.queue_draw()
+
+    def _peek_timeout(self):
+        self._ids["peek"] = 0
+        self.end_peek()
+        return GLib.SOURCE_REMOVE
+
+    # ---- pointer
+    def on_enter(self, widget, ev):
+        self.pointer_inside = True
+        self._cancel("close")
+        self.retarget()
+        if self.media_playing() or self.batt_state in (1, 5) or self.dl_active:
+            self.ensure_visual_tick()
+        if not self.open and not self._ids["open"]:
+            self._ids["open"] = GLib.timeout_add(HOVER_OPEN_DELAY_MS, self._do_open)
+        self.queue_draw()
+        return False
+
+    def on_leave(self, widget, ev):
+        self._cancel("open")
+        if self.open and not self._ids["close"]:
+            self._ids["close"] = GLib.timeout_add(350, self._do_close)
+        elif not self.open:
+            self.pointer_inside = False
+            self.retarget()
+            self.queue_draw()
+        return False
+
+    def _do_open(self):
+        self._ids["open"] = 0
+        self.set_open(True)
+        return GLib.SOURCE_REMOVE
+
+    def _do_close(self):
+        self._ids["close"] = 0
+        self.set_open(False)
+        self.pointer_inside = False
+        self.retarget()
+        self.queue_draw()
+        return GLib.SOURCE_REMOVE
+
+    def on_press(self, widget, ev):
+        if ev.button == 3:
+            menu = Gtk.Menu()
+            item = Gtk.MenuItem.new_with_label("Quit Island")
+            item.connect("activate", lambda *_: Gtk.main_quit())
+            menu.append(item)
+            menu.show_all()
+            menu.popup_at_pointer(ev)
+            return True
+        if ev.button != 1:
+            return False
+        if self.open:
+            for x, y, w, h, fn in self.hits:
+                if x <= ev.x <= x + w and y <= ev.y <= y + h:
+                    fn()
+                    self.queue_draw()
+                    return True
+            self.set_open(False)
+            return True
+        if self.peek_on:
+            self.end_peek()
+        else:
+            self._cancel("open")
+            self.set_open(True)
+        return True
+
+    # ---- once-a-second work (only while open or a timer is running)
+    def ensure_sec(self):
+        if (self.open or self.timer_end is not None) and not self._ids["sec"]:
+            self._ids["sec"] = GLib.timeout_add_seconds(1, self.on_sec)
+
+    def on_sec(self):
+        if not (self.open or self.timer_end is not None):
+            self._ids["sec"] = 0
+            return GLib.SOURCE_REMOVE
+        if self.timer_end is not None and self.timer_left() <= 0:
+            self.timer_done()
+        if self.open:
+            self.sample_stats()
+            self.check_pointer()
+            tw, th = self.target()   # a row may have appeared (Bluetooth / Wi-Fi found)
+            if abs(tw - self.w) > 0.3 or abs(th - self.h) > 0.3:
+                self.retarget()
+        self.queue_draw()
+        return GLib.SOURCE_CONTINUE
+
+    def sample_stats(self):
+        try:
+            cur = read_cpu()
+            if self.cpu_prev:
+                di, dt = cur[0] - self.cpu_prev[0], cur[1] - self.cpu_prev[1]
+                if dt > 0:
+                    self.cpu_pct = max(0, min(100, int(round(100.0 * (1 - di / dt)))))
+            self.cpu_prev = cur
+        except OSError:
+            pass
+        try:
+            used, total = read_mem()
+            self.mem_used = used
+            self.mem_total = total
+        except OSError:
+            self.mem_used = self.mem_total = None
+        try:
+            self.temp_cached = read_temp(self.temp_file)
+        except OSError:
+            self.temp_cached = None
+
+    def check_pointer(self):
+        """Safety net in case a leave event is missed while the pill shrinks."""
+        gw = self.get_window()
+        seat = Gdk.Display.get_default().get_default_seat()
+        if gw is None or seat is None or self._ids["close"]:
+            return
+        _, px, py = seat.get_pointer().get_position()
+        wx, wy = gw.get_origin()
+        x, y, w, h = self.pill_rect()
+        if not (wx + x - 10 <= px <= wx + x + w + 10 and py <= wy + y + h + 10):
+            self._ids["close"] = GLib.timeout_add(350, self._do_close)
+
+    # ---- clock
+    def schedule_clock(self):
+        self._clock = clock_text()
+        self._clock_id = GLib.timeout_add_seconds(61 - time.localtime().tm_sec, self.on_clock)
+
+    def on_clock(self):
+        self.schedule_clock()
+        self.queue_draw()
+        return GLib.SOURCE_REMOVE
+
+    # ---- timer
+    def timer_left(self):
+        return int(math.ceil(self.timer_end - time.monotonic())) if self.timer_end else 0
+
+    def start_timer(self, mins):
+        self.timer_mins = mins
+        self.timer_end = time.monotonic() + mins * 60
+        self.ensure_sec()
+        self.retarget()
+
+    def add_timer(self, mins):
+        self.timer_mins += mins
+        self.timer_end += mins * 60
+
+    def cancel_timer(self):
+        self.timer_end = None
+        self.retarget()
+
+    def timer_done(self):
+        self.timer_end = None
+        play_alarm()
+        self.show_peek("timer", "Time's up", "%d min timer finished" % self.timer_mins, secs=10)
+        self.retarget()
+
+    # ---- media (MPRIS over D-Bus)
+    def init_mpris(self):
+        self.bus.signal_subscribe(
+            None, "org.freedesktop.DBus.Properties", "PropertiesChanged", MPRIS_PATH,
+            MPRIS_PLAYER, Gio.DBusSignalFlags.NONE, self.on_mpris_signal)
+        self.bus.signal_subscribe(
+            "org.freedesktop.DBus", "org.freedesktop.DBus", "NameOwnerChanged",
+            "/org/freedesktop/DBus", None, Gio.DBusSignalFlags.NONE, self.on_name_owner)
+        self.bus.call("org.freedesktop.DBus", "/org/freedesktop/DBus", "org.freedesktop.DBus",
+                      "ListNames", None, GLib.VariantType("(as)"), Gio.DBusCallFlags.NONE,
+                      2000, None, self.on_list_names)
+
+    def on_list_names(self, bus, res):
+        try:
+            names = bus.call_finish(res).unpack()[0]
+        except GLib.Error:
+            return
+        for name in names:
+            if name.startswith(MPRIS + "."):
+                bus.call("org.freedesktop.DBus", "/org/freedesktop/DBus", "org.freedesktop.DBus",
+                         "GetNameOwner", GLib.Variant("(s)", (name,)), GLib.VariantType("(s)"),
+                         Gio.DBusCallFlags.NONE, 2000, None, self.on_owner)
+
+    def on_owner(self, bus, res):
+        try:
+            owner = bus.call_finish(res).unpack()[0]
+        except GLib.Error:
+            return
+        bus.call(owner, MPRIS_PATH, "org.freedesktop.DBus.Properties", "GetAll",
+                 GLib.Variant("(s)", (MPRIS_PLAYER,)), GLib.VariantType("(a{sv})"),
+                 Gio.DBusCallFlags.NONE, 2000, None, self.on_getall, owner)
+
+    def on_getall(self, bus, res, owner):
+        try:
+            props = bus.call_finish(res).unpack()[0]
+        except GLib.Error:
+            return
+        self.update_player(owner, props, announce=False)
+
+    def on_mpris_signal(self, conn, sender, path, iface, signal_name, params, *_):
+        self.update_player(sender, params.unpack()[1], announce=True)
+
+    def on_name_owner(self, conn, sender, path, iface, signal_name, params, *_):
+        name, old, new = params.unpack()
+        if name.startswith(MPRIS + ".") and not new and old in self.players:
+            del self.players[old]
+            self.retarget()
+            self.queue_draw()
+
+    def update_player(self, sender, props, announce=True):
+        p = self.players.setdefault(sender, dict(status="Stopped", title="", artist="", t=0.0))
+        old_title = p["title"]
+        if "PlaybackStatus" in props:
+            p["status"] = props["PlaybackStatus"]
+        if "Metadata" in props:
+            md = props["Metadata"]
+            artist = md.get("xesam:artist", "")
+            if isinstance(artist, (list, tuple)):
+                artist = ", ".join(artist)
+            p["title"] = md.get("xesam:title", "") or ""
+            p["artist"] = artist or md.get("xesam:album", "") or ""
+        p["t"] = time.monotonic()
+        if (announce and p["status"] == "Playing" and p["title"]
+                and p["title"] != old_title and self.current_player()
+                and self.current_player()[0] == sender):
+            self.show_peek("music", p["title"], p["artist"])
+        self.retarget()
+        if self.media_playing() and (self.pointer_inside or self.open):
+            self.ensure_visual_tick()
+        self.queue_draw()
+
+    def current_player(self):
+        best = None
+        for sender, p in self.players.items():
+            if p["status"] == "Stopped" or not (p["title"] or p["status"] == "Playing"):
+                continue
+            key = (p["status"] == "Playing", p["t"])
+            if best is None or key > best[0]:
+                best = (key, sender, p)
+        return (best[1], best[2]) if best else None
+
+    def media_playing(self):
+        cur = self.current_player()
+        return bool(cur and cur[1]["status"] == "Playing")
+
+    def mpris_call(self, method):
+        cur = self.current_player()
+        if cur and self.bus:
+            self.bus.call(cur[0], MPRIS_PATH, MPRIS_PLAYER, method, None, None,
+                          Gio.DBusCallFlags.NONE, 2000, None, None)
+
+    # ---- lightweight visual animation (active only during a transition/download)
+    def ensure_visual_tick(self):
+        if not self.visual_id:
+            self.visual_id = GLib.timeout_add(33, self.on_visual_tick)
+
+    def on_visual_tick(self):
+        active = False
+        if self.media_playing() and (not HOVER_ONLY or self.pointer_inside or self.open):
+            self.music_phase = (self.music_phase + 0.22) % (2 * math.pi)
+            active = True
+        if self.dl_active and self.dl_fraction() is None and (not HOVER_ONLY or self.pointer_inside or self.open):
+            self.dl_phase += 0.018 * self.dl_phase_dir
+            if self.dl_phase >= 1.0:
+                self.dl_phase, self.dl_phase_dir = 1.0, -1.0
+            elif self.dl_phase <= 0.0:
+                self.dl_phase, self.dl_phase_dir = 0.0, 1.0
+            active = True
+        if self.charge_flash:
+            self.charge_phase = (self.charge_phase + 0.045) % 1.0
+            active = True
+        if self.batt_draw_pct is not None and self.batt_target_pct is not None:
+            diff = self.batt_target_pct - self.batt_draw_pct
+            if abs(diff) > 0.15:
+                # Exponential easing is smooth and doesn't overshoot the actual percentage.
+                self.batt_draw_pct += diff * 0.20
+                active = True
+            else:
+                self.batt_draw_pct = self.batt_target_pct
+        if active:
+            self.queue_draw()
+            return GLib.SOURCE_CONTINUE
+        self.visual_id = 0
+        return GLib.SOURCE_REMOVE
+
+    # ---- battery (UPower)
+    def init_battery(self):
+        try:
+            self.upower = Gio.DBusProxy.new_for_bus_sync(
+                Gio.BusType.SYSTEM, Gio.DBusProxyFlags.NONE, None, "org.freedesktop.UPower",
+                "/org/freedesktop/UPower/devices/DisplayDevice",
+                "org.freedesktop.UPower.Device", None)
+        except GLib.Error:
+            return
+        self.upower.connect("g-properties-changed", lambda *_: self.read_battery())
+        self.read_battery(initial=True)
+
+    def read_battery(self, initial=False):
+        p = self.upower
+        present = p.get_cached_property("IsPresent")
+        pct = p.get_cached_property("Percentage")
+        state = p.get_cached_property("State")
+        if not (present and present.unpack() and pct and state):
+            self.batt_pct = None
+            return
+        self.set_battery(int(round(pct.unpack())), state.unpack(), announce=not initial)
+
+    def start_charge_flash(self):
+        self.charge_flash = True
+        if self.charge_flash_id:
+            GLib.source_remove(self.charge_flash_id)
+        self.charge_flash_id = GLib.timeout_add(2200, self.end_charge_flash)
+        self.ensure_visual_tick()
+        self.retarget()
+        self.queue_draw()
+
+    def end_charge_flash(self):
+        self.charge_flash_id = 0
+        self.charge_flash = False
+        self.retarget()
+        self.queue_draw()
+        return GLib.SOURCE_REMOVE
+
+    def set_battery(self, pct, state, announce=True):
+        old_pct, old_state = self.batt_pct, self.batt_state
+        self.batt_pct, self.batt_state = pct, state
+        if self.batt_draw_pct is None:
+            self.batt_draw_pct = float(pct)
+        self.batt_target_pct = float(pct)
+        if abs(self.batt_draw_pct - self.batt_target_pct) > 0.1 or (self.open and state in (1, 5)):
+            self.ensure_visual_tick()
+        if announce and old_state is not None:
+            plugged = state in (1, 4, 5)
+            was_plugged = old_state in (1, 4, 5)
+            if state == 4 and old_state != 4:
+                self.show_peek("battery", "Fully charged", "%d%%" % pct, accent=GREEN)
+            elif plugged and not was_plugged:
+                self.start_charge_flash()
+            elif was_plugged and not plugged:
+                self.show_peek("battery", "On battery", "%d%% remaining" % pct)
+            elif state in (2, 6) and old_pct is not None:
+                for t in LOW_BATTERY:
+                    if old_pct > t >= pct:
+                        self.show_peek("battery", "Battery low", "%d%% remaining" % pct,
+                                       secs=6, accent=ORANGE)
+                        break
+        if self.open:
+            self.queue_draw()
+
+    # ---- bluetooth (BlueZ over the system bus; signals only, nothing is polled)
+    def init_bluetooth(self):
+        try:
+            self.sysbus = Gio.bus_get_sync(Gio.BusType.SYSTEM, None)
+        except GLib.Error:
+            return
+        flags = Gio.DBusSignalFlags.NONE
+        for iface, member, cb in (
+                ("org.freedesktop.DBus.Properties", "PropertiesChanged", self.on_bt_props),
+                ("org.freedesktop.DBus.ObjectManager", "InterfacesAdded", self.on_bt_added),
+                ("org.freedesktop.DBus.ObjectManager", "InterfacesRemoved", self.on_bt_removed)):
+            self.sysbus.signal_subscribe("org.bluez", iface, member, None, None, flags, cb)
+        Gio.bus_watch_name(Gio.BusType.SYSTEM, "org.bluez", Gio.BusNameWatcherFlags.NONE,
+                           self.on_bt_appeared, self.on_bt_vanished)
+
+    def on_bt_appeared(self, conn, name, owner):
+        conn.call("org.bluez", "/", "org.freedesktop.DBus.ObjectManager", "GetManagedObjects",
+                  None, GLib.VariantType("(a{oa{sa{sv}}})"), Gio.DBusCallFlags.NO_AUTO_START,
+                  3000, None, self.on_bt_managed)
+
+    def on_bt_vanished(self, conn, name):
+        self.bt_adapter, self.bt_powered, self.bt_dev = None, None, {}
+        self.queue_draw()
+
+    def on_bt_managed(self, bus, res):
+        try:
+            objects = bus.call_finish(res).unpack()[0]
+        except GLib.Error:
+            return
+        for path, ifaces in objects.items():
+            for iface, props in ifaces.items():
+                self.bt_apply(path, iface, props, announce=False)
+        self.queue_draw()
+
+    def on_bt_props(self, conn, sender, path, iface, signal_name, params, *_):
+        which, changed, _invalidated = params.unpack()
+        self.bt_apply(path, which, changed, announce=True)
+
+    def on_bt_added(self, conn, sender, path, iface, signal_name, params, *_):
+        obj, ifaces = params.unpack()
+        for which, props in ifaces.items():
+            self.bt_apply(obj, which, props, announce=False)
+
+    def on_bt_removed(self, conn, sender, path, iface, signal_name, params, *_):
+        obj, ifaces = params.unpack()
+        if "org.bluez.Device1" in ifaces:
+            self.bt_dev.pop(obj, None)
+        if "org.bluez.Battery1" in ifaces and obj in self.bt_dev:
+            self.bt_dev[obj]["battery"] = None
+        if "org.bluez.Adapter1" in ifaces and obj == self.bt_adapter:
+            self.bt_adapter, self.bt_powered = None, None
+        self.queue_draw()
+
+    def bt_apply(self, path, iface, props, announce):
+        if iface == "org.bluez.Adapter1":
+            if "Powered" in props:
+                self.bt_adapter = self.bt_adapter or path
+                if path == self.bt_adapter:
+                    self.bt_powered = bool(props["Powered"])
+        elif iface == "org.bluez.Device1":
+            d = self.bt_dev.setdefault(path, {"name": "", "connected": False, "battery": None})
+            name = props.get("Alias") or props.get("Name")
+            if name:
+                d["name"] = name
+            if "Connected" in props:
+                now = bool(props["Connected"])
+                changed = now != d["connected"]
+                d["connected"] = now
+                if announce and changed:
+                    body = "Disconnected"
+                    if now:
+                        body = "Connected" + (" · %d%%" % d["battery"]
+                                              if d["battery"] is not None else "")
+                    self.show_peek("bt", d["name"] or "Bluetooth device", body,
+                                   accent=BLUE if now else None)
+        elif iface == "org.bluez.Battery1":
+            d = self.bt_dev.setdefault(path, {"name": "", "connected": False, "battery": None})
+            if "Percentage" in props:
+                d["battery"] = int(props["Percentage"])
+        if self.open:
+            self.queue_draw()
+
+    def bt_summary(self):
+        """Text and colour for the Bluetooth button in the open card."""
+        if self.bt_note:
+            return self.bt_note, ORANGE
+        if not self.bt_powered:
+            return "Off", DIM
+        connected = [d for d in self.bt_dev.values() if d["connected"]]
+        if not connected:
+            return "On", BLUE
+        if len(connected) > 1:
+            return "%d devices" % len(connected), WHITE
+        d = connected[0]
+        label = d["name"] or "Device"
+        if d["battery"] is not None:
+            label += " %d%%" % d["battery"]
+        return label, WHITE
+
+    def bt_toggle(self):
+        if not self.bt_adapter or self.sysbus is None:
+            return
+        self.sysbus.call(
+            "org.bluez", self.bt_adapter, "org.freedesktop.DBus.Properties", "Set",
+            GLib.Variant("(ssv)", ("org.bluez.Adapter1", "Powered",
+                                   GLib.Variant("b", not self.bt_powered))),
+            None, Gio.DBusCallFlags.NO_AUTO_START, 3000, None, self.on_bt_set)
+
+    def on_bt_set(self, bus, res):
+        try:
+            bus.call_finish(res)
+        except GLib.Error as e:
+            self.bt_note = "Blocked" if "rfkill" in e.message.lower() else "Failed"
+            GLib.timeout_add(3000, self.clear_bt_note)
+            self.queue_draw()
+
+    def clear_bt_note(self):
+        self.bt_note = ""
+        self.queue_draw()
+        return GLib.SOURCE_REMOVE
+
+    # ---- Wi-Fi (NetworkManager over the system bus; property signals only, nothing is polled)
+    def init_wifi(self):
+        Gio.bus_watch_name(Gio.BusType.SYSTEM, NM, Gio.BusNameWatcherFlags.NONE,
+                           self.on_nm_appeared, self.on_nm_vanished)
+
+    def on_nm_appeared(self, conn, name, owner):
+        try:
+            self.nm = Gio.DBusProxy.new_for_bus_sync(
+                Gio.BusType.SYSTEM, Gio.DBusProxyFlags.DO_NOT_AUTO_START, None,
+                NM, NM_PATH, NM, None)
+        except GLib.Error:
+            return
+        self.nm.connect("g-properties-changed", lambda *_: self.wifi_refresh())
+        self.wifi_refresh(announce=False)
+
+    def on_nm_vanished(self, conn, name):
+        self.nm = self.wdev = self.wdev_wl = self.wap = None
+        self.wap_path = ""
+        self.wifi_on, self.wifi_up, self.wifi_ssid = None, False, ""
+        self.retarget()
+        self.queue_draw()
+
+    def wifi_find_device(self):
+        """Asynchronously discover the Wi-Fi device. Guarded so only one
+        discovery is in flight at a time, preventing repeated synchronous
+        GetDevices calls from blocking the GTK main loop on NM property churn."""
+        if self._wifi_find_in_flight or self.nm is None:
+            return
+        self._wifi_find_in_flight = True
+        self._wifi_device_paths = []
+        self._wifi_device_index = 0
+        self.nm.call("GetDevices", None, Gio.DBusCallFlags.NO_AUTO_START, 2000, None,
+                     self._on_get_devices)
+
+    def _on_get_devices(self, conn, res):
+        self._wifi_find_in_flight = False
+        try:
+            devices = conn.call_finish(res).unpack()[0]
+        except GLib.Error:
+            return
+        self._wifi_device_paths = list(devices)
+        self._try_next_device()
+
+    def _try_next_device(self):
+        if self.wdev is not None or self._wifi_device_index >= len(self._wifi_device_paths):
+            return
+        path = self._wifi_device_paths[self._wifi_device_index]
+        self._wifi_device_index += 1
+        Gio.DBusProxy.new_for_bus(Gio.BusType.SYSTEM,
+            Gio.DBusProxyFlags.DO_NOT_AUTO_START, None,
+            NM, path, NM + ".Device", None,
+            self._on_device_proxy, path)
+
+    def _on_device_proxy(self, source, res, path):
+        try:
+            dev = Gio.DBusProxy.new_for_bus_finish(res)
+        except GLib.Error:
+            self._try_next_device()
+            return
+        kind = dev.get_cached_property("DeviceType")
+        if kind is not None and kind.unpack() == 2:   # 2 = Wi-Fi
+            self.wdev = dev
+            dev.connect("g-properties-changed", lambda *_: self.wifi_refresh())
+            self._try_next_wireless(dev)
+        else:
+            self._try_next_device()
+
+    def _try_next_wireless(self, dev):
+        path = dev.get_object_path()
+        Gio.DBusProxy.new_for_bus(Gio.BusType.SYSTEM,
+            Gio.DBusProxyFlags.DO_NOT_AUTO_START, None,
+            NM, path, NM + ".Device.Wireless", None,
+            self._on_wireless_proxy, dev)
+
+    def _on_wireless_proxy(self, source, res, dev):
+        try:
+            self.wdev_wl = Gio.DBusProxy.new_for_bus_finish(res)
+        except GLib.Error:
+            self.wdev = None
+            self._try_next_device()
+            return
+        self.wdev_wl.connect("g-properties-changed", lambda *_: self.wifi_refresh())
+        self.wifi_refresh()
+
+    def wifi_watch_ap(self, path):
+        self.wap_path, self.wap = path, None
+        if path and path != "/":
+            Gio.DBusProxy.new_for_bus(Gio.BusType.SYSTEM,
+                Gio.DBusProxyFlags.DO_NOT_AUTO_START, None,
+                NM, path, NM + ".AccessPoint", None,
+                self._on_ap_proxy)
+        else:
+            self.wifi_read_ap()
+
+    def _on_ap_proxy(self, source, res):
+        try:
+            self.wap = Gio.DBusProxy.new_for_bus_finish(res)
+        except GLib.Error:
+            self.wap = None
+        if self.wap is not None:
+            self.wap.connect("g-properties-changed", self.on_ap_props)
+        self.wifi_read_ap()
+
+    def wifi_read_ap(self):
+        ssid, strength = "", 0
+        if self.wap is not None:
+            v = self.wap.get_cached_property("Ssid")
+            if v is not None:
+                ssid = bytes(v.unpack()).decode("utf-8", "replace")
+            v = self.wap.get_cached_property("Strength")
+            if v is not None:
+                strength = int(v.unpack())
+        self.wifi_ssid, self.wifi_strength = ssid, strength
+
+    def on_ap_props(self, *_):
+        self.wifi_read_ap()
+        if self.open:
+            self.queue_draw()
+
+    def wifi_refresh(self, announce=True):
+        if self.nm is None:
+            return
+        v = self.nm.get_cached_property("WirelessEnabled")
+        self.wifi_on = bool(v.unpack()) if v is not None else None
+        v = self.nm.get_cached_property("WirelessHardwareEnabled")
+        self.wifi_hw = bool(v.unpack()) if v is not None else True
+        if self.wdev is not None:       # adapter unplugged?
+            v = self.nm.get_cached_property("Devices")
+            if v is not None and self.wdev.get_object_path() not in v.unpack():
+                self.wdev = self.wdev_wl = self.wap = None
+                self.wap_path = ""
+                self.wifi_ssid, self.wifi_strength = "", 0
+        if self.wdev is None:
+            self.wifi_find_device()
+        up = False
+        if self.wdev is not None:
+            v = self.wdev.get_cached_property("State")
+            self.wifi_state = int(v.unpack()) if v is not None else 0
+            v = self.wdev_wl.get_cached_property("ActiveAccessPoint")
+            path = v.unpack() if v is not None else "/"
+            if path != self.wap_path:
+                self.wifi_watch_ap(path)
+            up = self.wifi_state == 100 and bool(self.wifi_ssid)
+        was, self.wifi_up = self.wifi_up, up
+        if up:
+            self.wifi_seen = self.wifi_ssid
+        if announce and up != was:
+            if up:
+                self.show_peek("wifi", self.wifi_ssid, "Wi-Fi connected", accent=BLUE)
+            elif self.wifi_on is False or self.wifi_state == 20:   # 20: radio switched off
+                self.show_peek("wifi", "Wi-Fi off")
+            else:
+                self.show_peek("wifi", "Wi-Fi disconnected", self.wifi_seen)
+        sig = (self.wifi_on, self.wifi_hw, self.wifi_up, self.wifi_ssid, self.wifi_state,
+               self.wdev is not None)
+        if sig != self.wifi_sig:        # NetworkManager changes properties often; redraw only on news
+            self.wifi_sig = sig
+            self.retarget()
+            self.queue_draw()
+
+    def wifi_level(self):
+        if not self.wifi_up:
+            return 0
+        s = self.wifi_strength
+        return 3 if s >= 67 else (2 if s >= 34 else 1)
+
+    def wifi_summary(self):
+        """Text and colour for the Wi-Fi button in the open card."""
+        if self.wifi_note:
+            return self.wifi_note, ORANGE
+        if not self.wifi_on:
+            return "Off", DIM
+        if self.wifi_up:
+            return self.wifi_ssid, WHITE
+        if 40 <= self.wifi_state < 100:
+            return "Connecting", DIM
+        return "Not connected", DIM
+
+    def wifi_toggle(self):
+        if self.nm is None or self.wifi_on is None:
+            return
+        if not self.wifi_hw:
+            self.wifi_flash("Blocked")
+            return
+        self.nm.get_connection().call(
+            NM, NM_PATH, "org.freedesktop.DBus.Properties", "Set",
+            GLib.Variant("(ssv)", (NM, "WirelessEnabled", GLib.Variant("b", not self.wifi_on))),
+            None, Gio.DBusCallFlags.NO_AUTO_START, 3000, None, self.on_wifi_set)
+
+    def on_wifi_set(self, conn, res):
+        try:
+            conn.call_finish(res)
+        except GLib.Error:
+            self.wifi_flash("Failed")
+
+    def wifi_flash(self, text):
+        self.wifi_note = text
+        GLib.timeout_add(3000, self.clear_wifi_note)
+        self.queue_draw()
+
+    def clear_wifi_note(self):
+        self.wifi_note = ""
+        self.queue_draw()
+        return GLib.SOURCE_REMOVE
+
+    # ---- downloads
+    # Two sources, both cheap:
+    #  * apps that report progress with the Unity "LauncherEntry" D-Bus signal (it is how
+    #    apps feed a taskbar progress bar; only apps that send it get a real percentage,
+    #    Firefox does not): event driven, costs nothing until a signal arrives
+    #  * incoming traffic on physical interfaces is an optional fallback only. Network traffic
+    #    alone cannot distinguish a file download from streaming, so it is disabled by default.
+    #    Firefox does not publish a reliable total/progress fraction to this integration; show an
+    #    indeterminate bar rather than a misleading speed-scaled completion bar.
+    def init_progress_sources(self):
+        self.bus.signal_subscribe(
+            None, "com.canonical.Unity.LauncherEntry", "Update", None, None,
+            Gio.DBusSignalFlags.NONE, self.on_launcher_entry)
+
+    def on_launcher_entry(self, conn, sender, path, iface, signal_name, params, *_):
+        try:
+            app, props = params.unpack()
+        except (ValueError, TypeError):
+            return
+        if "progress" not in props and "progress-visible" not in props:
+            return                      # a badge count, not a progress update
+        if props.get("progress-visible", app in self.progress):
+            old = self.progress.get(app, (0.0, 0.0))[0]
+            frac = float(props.get("progress", old))
+            self.progress[app] = (max(0.0, min(1.0, frac)), time.monotonic())
+        else:
+            self.progress.pop(app, None)
+            if self.dl_active:
+                self.dl_lows = max(self.dl_lows, 2)   # app says it is done: end on the next sample
+
+    def dl_fraction(self):
+        """Progress 0..1 reported by an app, or None."""
+        now = time.monotonic()
+        best = None
+        for app, (frac, t) in list(self.progress.items()):
+            if now - t > 30:            # app stopped updating (closed, crashed)
+                del self.progress[app]
+            elif best is None or frac > best:
+                best = frac
+        return best
+
+    def dl_bar(self):
+        """(fill 0..1, colour, is it a real percentage)"""
+        frac = self.dl_fraction()
+        if frac is not None:
+            return frac, GREEN, True
+        # Firefox exposes no reliable system-wide file total/progress signal here. Do not
+        # disguise network speed as a completion percentage: use a moving indeterminate bar.
+        return None, BLUE, False
+
+    def init_downloads(self):
+        self.net_ifs = set(net_ifaces())
+        GLib.timeout_add(max(100, int(NET_POLL_SECONDS * 1000)), self.on_net)
+
+    def on_net(self):
+        now = time.monotonic()
+        self.net_polls += 1
+        if self.net_polls % 30 == 0:    # pick up newly plugged adapters
+            self.net_ifs = set(net_ifaces())
+        try:
+            rx = read_net_rx(self.net_ifs)
+        except (OSError, ValueError):
+            return GLib.SOURCE_CONTINUE
+        prev, self.net_prev = self.net_prev, (now, rx)
+        if prev is None or now - prev[0] > 30:     # first sample, or the laptop was asleep
+            self.dl_rate = None
+            return GLib.SOURCE_CONTINUE
+        dt = now - prev[0]
+        delta = max(0, rx - prev[1])
+        inst = delta / dt
+        self.dl_rate = inst if self.dl_rate is None else 0.5 * self.dl_rate + 0.5 * inst
+        thr = DOWNLOAD_MIN_KBPS * 1024.0
+        reported = self.dl_fraction() is not None
+        # Only scan the Downloads dir for unfinished browser files when there is
+        # incoming traffic or we are already tracking a download. Scanning every
+        # 500 ms when idle is wasteful.
+        partial = None
+        if self.dl_active or inst > 1024.0:
+            partial = find_partial(self.dl_dir)
+        network_candidate = DOWNLOAD_NETWORK_FALLBACK and inst >= thr
+        if not self.dl_active:
+            # Prefer direct evidence: an unfinished browser file or an app progress signal.
+            # Generic RX traffic is ambiguous (video streams, calls, game updates), so it is
+            # deliberately opt-in rather than causing false "Downloading" states by default.
+            if partial or reported or network_candidate:
+                self.dl_hits += 1
+                self.dl_pending += delta
+            else:
+                self.dl_hits, self.dl_pending = 0, 0
+            if reported or self.dl_hits >= DOWNLOAD_CONFIRM_SAMPLES:
+                self.dl_start(source=("reported" if reported else
+                                      "partial" if partial else "network"))
+        else:
+            self.dl_bytes += delta
+            self.dl_peak = max(self.dl_peak, self.dl_rate or 0.0)
+            # If the download was identified by a browser temp file, unrelated network traffic
+            # must not keep it alive after that file disappears. Progress-reported tasks are
+            # governed by their own signal and a short stale-signal grace period.
+            if self.dl_source == "partial":
+                evidence = bool(partial) or reported
+                low_limit = 4
+            elif self.dl_source == "reported":
+                evidence = reported
+                low_limit = 6
+            else:
+                evidence = network_candidate
+                low_limit = 6
+            if evidence:
+                self.dl_lows = 0
+            else:
+                self.dl_lows += 1
+            if self.dl_lows >= low_limit:
+                self.dl_stop()
+            else:
+                name = partial
+                if name and name != self.dl_name:
+                    self.dl_name = name
+                    self.retarget()
+        if self.dl_active and self.dl_fraction() is None:
+            self.ensure_visual_tick()
+        if self.dl_active or self.open:
+            self.queue_draw()
+        return GLib.SOURCE_CONTINUE
+
+    def dl_start(self, source="partial"):
+        self.dl_active = True
+        self.dl_source = source
+        self.ensure_visual_tick()
+        self.dl_bytes = 0        # count only bytes after confirmation; dl_pending is for hit detection only
+        self.dl_peak = self.dl_rate or 0.0
+        self.dl_lows = 0
+        self.dl_name = find_partial(self.dl_dir) or ""
+        self.retarget()
+        self.queue_draw()
+
+    def dl_stop(self):
+        self.dl_active = False
+        if DOWNLOAD_DONE_PEEK and self.dl_bytes >= DONE_MIN_BYTES:
+            size = fmt_size(self.dl_bytes)
+            self.show_peek("download", "Download finished",
+                           "%s · %s" % (self.dl_name, size) if self.dl_name else size,
+                           secs=5, accent=GREEN)
+        self.dl_hits = self.dl_lows = self.dl_pending = self.dl_bytes = 0
+        self.dl_rate, self.dl_name = None, ""
+        self.dl_source = ""
+        self.retarget()
+        self.queue_draw()
+
+    # ---- notifications (passive D-Bus monitor, no daemon is replaced)
+    def init_notifications(self):
+        try:
+            addr = Gio.dbus_address_get_for_bus_sync(Gio.BusType.SESSION, None)
+        except GLib.Error as e:
+            print("island: notification peek disabled:", e.message, file=sys.stderr)
+            return
+        Gio.DBusConnection.new_for_address(
+            addr, Gio.DBusConnectionFlags.AUTHENTICATION_CLIENT
+            | Gio.DBusConnectionFlags.MESSAGE_BUS_CONNECTION, None, None,
+            self._on_notif_connection)
+
+    def _on_notif_connection(self, source, res):
+        try:
+            conn = Gio.DBusConnection.new_for_address_finish(res)
+        except GLib.Error as e:
+            print("island: notification peek disabled:", e.message, file=sys.stderr)
+            return
+        rule = ("type='method_call',interface='org.freedesktop.Notifications',"
+                "member='Notify'")
+        conn.call("org.freedesktop.DBus", "/org/freedesktop/DBus",
+                  "org.freedesktop.DBus.Monitoring", "BecomeMonitor",
+                  GLib.Variant("(asu)", ([rule], 0)), None,
+                  Gio.DBusCallFlags.NONE, 3000,
+                  None, self._on_become_monitor, conn)
+
+    def _on_become_monitor(self, connection, res, user_data=None):
+        try:
+            connection.call_finish(res)
+        except GLib.Error as e:
+            print("island: notification peek disabled:", e.message, file=sys.stderr)
+            return
+        connection.add_filter(self.notif_filter)
+        self.mon_conn = connection
+
+    def notif_filter(self, conn, msg, incoming):
+        # runs on a GDBus worker thread: only hand the data to the main loop
+        try:
+            if (msg.get_message_type() == Gio.DBusMessageType.METHOD_CALL
+                    and msg.get_member() == "Notify"):
+                b = msg.get_body().unpack()
+                GLib.idle_add(self.on_notify, b[0], b[3], b[4])
+        except Exception:
+            pass
+        return None
+
+    def on_notify(self, app, summary, body):
+        clean = lambda s: html.unescape(re.sub(r"<[^>]+>", "", s or "")).replace("\n", " ").strip()
+        summary, body = clean(summary), clean(body)
+        if not summary and not body:
+            return GLib.SOURCE_REMOVE
+        now = time.monotonic()
+        if self.last_notif[0] == summary + "\0" + body and now - self.last_notif[1] < 2:
+            return GLib.SOURCE_REMOVE
+        self.last_notif = (summary + "\0" + body, now)
+        self.show_peek("notify", summary or app, body if summary else "", secs=5, app=app)
+        return GLib.SOURCE_REMOVE
+
+    # ---------------------------------------------------------------- paint ----
+    def on_draw(self, widget, cr):
+        cr.set_operator(cairo.OPERATOR_SOURCE)
+        cr.set_source_rgba(0, 0, 0, 0)
+        cr.paint()
+        cr.set_operator(cairo.OPERATOR_OVER)
+        self.paint(cr)
+        return False
+
+    def paint(self, cr):
+        if HOVER_ONLY and not self.pointer_inside and not self.open and not self.peek_on and not self.activity_visible():
+            return  # completely transparent while idle; the tiny top-edge hit-zone still works
+        x, y, w, h = self.pill_rect()
+        shape_path(cr, x, y, w, h)
+        cr.set_source_rgba(*BLACK)
+        if NOTCH:
+            cr.fill()  # pure black, no outline: it should read as part of the screen edge
+        else:
+            cr.fill_preserve()
+            cr.set_source_rgba(1, 1, 1, 0.10)
+            cr.set_line_width(1)
+            cr.stroke()
+        cr.save()
+        shape_path(cr, x, y, w, h)
+        cr.clip()
+        # Each layer is fully visible while the island is inside its (width range, height range),
+        # so growing a row (download starts, Wi-Fi row appears) does not flicker the content.
+        layers = [((self.idle_w(False), self.idle_w(True)), (IDLE_H, IDLE_H + DL_EXTRA),
+                   self.draw_idle),
+                  ((PEEK_W, PEEK_W), (PEEK_H, PEEK_H), self.draw_peek),
+                  ((OPEN_W, OPEN_W), (OPEN_H_BASE, OPEN_H_MAX), self.draw_open)]
+        for (wlo, whi), (hlo, hhi), fn in layers:
+            dist = 0.0
+            for cur, lo, hi in ((self.w, wlo, whi), (self.h, hlo, hhi)):
+                if cur < lo:
+                    dist += (lo - cur) / hi
+                elif cur > hi:
+                    dist += (cur - hi) / hi
+            alpha = max(0.0, 1.0 - dist * 4.0)
+            if alpha > 0.01:
+                cr.push_group()
+                fn(cr)
+                cr.pop_group_to_source()
+                cr.paint_with_alpha(alpha)
+        cr.restore()
+
+    def draw_idle(self, cr):
+        cy = TOP_MARGIN + IDLE_H / 2.0
+        # A charger connection gets a short animated battery-only appearance, then disappears.
+        if self.charge_flash and not self.media_playing() and not self.dl_active:
+            pct = self.batt_draw_pct if self.batt_draw_pct is not None else (self.batt_pct or 0)
+            draw_battery(cr, WIN_W / 2.0 - 11, cy, pct, True, GREEN,
+                         0.5 + 0.5 * math.sin(self.charge_phase * 2 * math.pi))
+            return
+        # During activity, replace the clock with the actual track/file name. The pill
+        # grows sideways only; the full controls still appear on hover.
+        kind, activity_label = self.idle_activity()
+        if kind:
+            available = max(40, self.w - 48)
+            label_width = min(available, 310)
+            if kind == "music":
+                icon_x = WIN_W / 2.0 - (min(self.w, measure(activity_label, 10.5, True) + 52)) / 2.0
+                draw_bars(cr, icon_x, cy, GREEN, self.music_phase)
+                draw_text(cr, activity_label, icon_x + 18, cy, 10.5, WHITE, bold=True,
+                          width=max(30, label_width))
+            else:
+                fill, col, known = self.dl_bar()
+                total = min(self.w, measure(activity_label, 10.5, True) + 54)
+                icon_x = WIN_W / 2.0 - total / 2.0
+                draw_down_arrow(cr, icon_x + 5, cy, col, 0.9)
+                draw_text(cr, activity_label, icon_x + 17, cy, 10.5, WHITE, bold=True,
+                          width=max(30, label_width))
+                px, _, pw, _ = self.pill_rect()
+                if known:
+                    progress_bar(cr, px + 16, TOP_MARGIN + IDLE_H - 1, pw - 32, 3, fill, col)
+                else:
+                    indeterminate_bar(cr, px + 16, TOP_MARGIN + IDLE_H - 1, pw - 32, 3,
+                                      self.dl_phase, col)
+            return
+        txt = fmt_mmss(max(0, self.timer_left())) if self.timer_end is not None else clock_text()
+        color = ORANGE if self.timer_end is not None else WHITE
+        draw_text(cr, txt, WIN_W / 2.0, cy, 10.5, color, bold=True, align=1)
+
+    def draw_peek(self, cr):
+        pk = self.peek
+        if not pk:
+            return
+        px, py = (WIN_W - PEEK_W) / 2.0, float(TOP_MARGIN)
+        cx, cy = px + 32, py + PEEK_H / 2.0
+        kind = pk["kind"]
+        accent = pk["accent"] or WHITE
+        cr.set_source_rgba(1, 1, 1, 0.14)
+        if kind == "timer":
+            cr.set_source_rgba(*ORANGE[:3], 0.22)
+        elif kind in ("battery", "bt", "wifi", "download") and pk["accent"]:
+            cr.set_source_rgba(*accent[:3], 0.22)
+        cr.arc(cx, cy, 16, 0, 2 * math.pi)
+        cr.fill()
+        if kind == "notify":
+            letter = (pk["app"] or pk["title"] or "?").strip()[:1].upper() or "?"
+            draw_text(cr, letter, cx, cy, 12, WHITE, bold=True, align=1)
+        elif kind == "battery":
+            pct = self.batt_pct if self.batt_pct is not None else 50
+            col = accent if pk["accent"] else WHITE
+            draw_battery(cr, cx - 11, cy, pct, self.batt_state in (1, 5), col)
+        elif kind == "timer":
+            draw_clock_icon(cr, cx, cy, 8, ORANGE)
+        elif kind == "bt":
+            draw_bt_glyph(cr, cx, cy, accent if pk["accent"] else (1, 1, 1, 0.6), 1.2)
+        elif kind == "wifi":
+            draw_wifi_glyph(cr, cx, cy, accent if pk["accent"] else (1, 1, 1, 0.6),
+                            3 if pk["accent"] else 0)
+        elif kind == "download":
+            draw_down_arrow(cr, cx, cy, accent, 1.2)
+        else:  # music
+            draw_bars(cr, cx - 6, cy, GREEN)
+        tx, tw = px + 62, PEEK_W - 62 - 20
+        if pk["body"]:
+            draw_text(cr, pk["title"], tx, py + 21, 10.5, WHITE, bold=True, width=tw)
+            draw_text(cr, pk["body"], tx, py + 40, 9, DIM, width=tw)
+        else:
+            draw_text(cr, pk["title"], tx, cy, 10.5, WHITE, bold=True, width=tw)
+
+    def conn_chip(self, cr, x, cy, label, color, on, icon, fn, maxw=110):
+        """Button with an icon and a label (Wi-Fi, Bluetooth). Returns its width."""
+        h = 26
+        w = int(min(measure(label, 9.5, True), maxw)) + 38
+        cr.set_source_rgba(*((0.35, 0.62, 1.0, 0.20) if on else FAINT))
+        rounded_rect(cr, x, cy - h / 2.0, w, h, h / 2.0)
+        cr.fill()
+        icon(cr, x + 15, cy, BLUE if on else DIM)
+        draw_text(cr, label, x + 27, cy, 9.5, color, bold=True, width=maxw)
+        self.hits.append((x, cy - h / 2.0, w, h, fn))
+        return w
+
+    def chip(self, cr, x, cy, w, label, fn, fg=WHITE, bg=FAINT):
+        h = 26
+        cr.set_source_rgba(*bg)
+        rounded_rect(cr, x, cy - h / 2.0, w, h, h / 2.0)
+        cr.fill()
+        draw_text(cr, label, x + w / 2.0, cy, 9.5, fg, bold=True, align=1)
+        self.hits.append((x, cy - h / 2.0, w, h, fn))
+
+    def round_button(self, cr, cx, cy, r, kind, fn, solid=False):
+        if solid:
+            cr.set_source_rgba(1, 1, 1, 0.95)
+        else:
+            cr.set_source_rgba(1, 1, 1, 0.10)
+        cr.arc(cx, cy, r, 0, 2 * math.pi)
+        cr.fill()
+        cr.set_source_rgba(*((0, 0, 0, 1) if solid else WHITE))
+        s = r * 0.5
+        if kind == "play":
+            glyph_tri(cr, cx + 1, cy, s * 1.2)
+        elif kind == "pause":
+            glyph_pause(cr, cx, cy, s * 1.1)
+        elif kind == "next":
+            glyph_skip(cr, cx, cy, s, 1)
+        else:
+            glyph_skip(cr, cx, cy, s, -1)
+        self.hits.append((cx - r, cy - r, 2 * r, 2 * r, fn))
+
+    def draw_open(self, cr):
+        self.hits = []
+        ox, oy = (WIN_W - OPEN_W) / 2.0, float(TOP_MARGIN)
+        left, right = ox + 22, ox + OPEN_W - 22
+        cur = self.current_player()
+
+        # row A: media, or big clock + date
+        if cur:
+            p = cur[1]
+            by = oy + 34
+            playing = p["status"] == "Playing"
+            text_left = left
+            if playing:
+                draw_bars(cr, left, by - 1, GREEN, self.music_phase)
+                text_left += 20
+            draw_text(cr, p["title"] or "Unknown", text_left, by - 9, 11, WHITE, bold=True,
+                      width=OPEN_W - 172)
+            draw_text(cr, p["artist"] or p["status"], text_left, by + 10, 9, DIM, width=OPEN_W - 172)
+            self.round_button(cr, right - 105, by, 15, "prev", lambda: self.mpris_call("Previous"))
+            self.round_button(cr, right - 68, by, 17, "pause" if playing else "play",
+                              lambda: self.mpris_call("PlayPause"), solid=True)
+            self.round_button(cr, right - 30, by, 15, "next", lambda: self.mpris_call("Next"))
+        else:
+            draw_text(cr, clock_text(), left, oy + 33, 20, WHITE, bold=True)
+            draw_text(cr, time.strftime("%A, %d %b"), right, oy + 33, 10.5, DIM, align=2)
+
+        cr.set_source_rgba(*FAINT)
+        cr.rectangle(left, oy + 64, right - left, 1)
+        cr.fill()
+
+        # row B: stats
+        cy = oy + 83
+        colw = (right - left) / 4.0
+        cells = [
+            ("CPU", "--" if self.cpu_pct is None else "%d%%" % self.cpu_pct),
+            ("RAM", "--" if self.mem_used is None else "%.1fG" % self.mem_used),
+            ("TEMP", "--" if self.temp_cached is None else "%d°" % round(self.temp_cached)),
+        ]
+        for i, (label, value) in enumerate(cells):
+            cx = left + i * colw
+            lw = draw_text(cr, label, cx, cy, 8, DIM)
+            draw_text(cr, value, cx + lw + 5, cy, 10, WHITE, bold=True)
+        bx = left + 3 * colw
+        if self.batt_pct is None:
+            draw_text(cr, "AC", bx, cy, 10, DIM, bold=True)
+        else:
+            charging = self.batt_state in (1, 5)
+            col = GREEN if charging else (ORANGE if self.batt_pct <= LOW_BATTERY[0] else WHITE)
+            shown_pct = self.batt_draw_pct if self.batt_draw_pct is not None else self.batt_pct
+            pulse = 0.5 + 0.5 * math.sin(self.charge_phase * 2 * math.pi)
+            draw_battery(cr, bx, cy, shown_pct, charging, col, pulse)
+            draw_text(cr, "%d%%" % self.batt_pct, bx + 29, cy, 10, WHITE, bold=True)
+
+        # row C: timer
+        cy = oy + 118
+        if self.timer_end is not None:
+            draw_text(cr, fmt_mmss(max(0, self.timer_left())), left, cy, 12, ORANGE, bold=True)
+            self.chip(cr, left + 74, cy, 46, "+5m", lambda: self.add_timer(5))
+            self.chip(cr, left + 128, cy, 64, "Cancel", self.cancel_timer, fg=ORANGE)
+        else:
+            draw_text(cr, "Timer", left, cy, 9, DIM)
+            x = left + 52
+            for m in TIMER_PRESETS:
+                self.chip(cr, x, cy, 48, "%dm" % m, lambda m=m: self.start_timer(m))
+                x += 56
+        has_conn = self.has_conn()
+        if cur and not has_conn:
+            draw_text(cr, clock_text(), right, cy, 10, DIM, align=2)
+
+        # row D: Wi-Fi and Bluetooth buttons (tap to switch on / off)
+        if has_conn:
+            cy += ROW_CONN_H
+            x = left
+            if self.wdev is not None:
+                label, color = self.wifi_summary()
+                on = bool(self.wifi_on) and not self.wifi_note
+                lvl = self.wifi_level()
+                x += self.conn_chip(
+                    cr, x, cy, label, color, on,
+                    lambda c, ix, iy, col: draw_wifi_glyph(c, ix, iy, col, lvl),
+                    self.wifi_toggle) + 8
+            if self.bt_powered is not None:
+                label, color = self.bt_summary()
+                on = bool(self.bt_powered) and not self.bt_note
+                self.conn_chip(cr, x, cy, label, color, on, draw_bt_glyph, self.bt_toggle)
+
+        # row E: download, only while one is running
+        if self.dl_active:
+            self.draw_download(cr, left, right, cy)
+
+    def draw_download(self, cr, left, right, last):
+        """File name, speed and bar. `last` is the vertical centre of the row above."""
+        cy = last + 37
+        cr.set_source_rgba(*FAINT)
+        cr.rectangle(left, last + 23, right - left, 1)
+        cr.fill()
+        fill, col, known = self.dl_bar()
+        speed = fmt_rate(self.dl_rate or 0.0)
+        if known:
+            info = "%d%% · %s" % (int(round(fill * 100)), speed)
+        else:
+            info = "%s · %s received" % (speed, fmt_size(self.dl_bytes))
+        iw = measure(info, 9.5, True)
+        draw_down_arrow(cr, left + 5, cy, col, 0.9)
+        draw_text(cr, info, right, cy, 9.5, WHITE, bold=True, align=2)
+        draw_text(cr, self.dl_name or "Downloading", left + 17, cy, 9.5, DIM,
+                  width=max(30, right - left - 17 - iw - 10))
+        if known:
+            progress_bar(cr, left, last + 50, right - left, 4, fill, col)
+        else:
+            indeterminate_bar(cr, left, last + 50, right - left, 4, self.dl_phase, col)
+
+
+# -------------------------------------------------------------------- main ----
+def single_instance():
+    path = os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"), "island-pill.lock")
+    fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        sys.exit(0)
+    return fd
+
+
+def main():
+    lock = single_instance()  # noqa: F841  (kept open for the process lifetime)
+    win = Island()
+    quit_cb = lambda *_: (Gtk.main_quit(), False)[1]
+    GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, signal.SIGINT, quit_cb)
+    GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, signal.SIGTERM, quit_cb)
+    win.show_all()
+    win.place()
+    GLib.timeout_add_seconds(3, release_startup_memory)
+    Gtk.main()
+
+
+def release_startup_memory():
+    """Hand back the memory that start-up (imports, first draw) left behind."""
+    import gc
+    gc.collect()
+    try:
+        import ctypes
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except OSError:
+        pass
+    return GLib.SOURCE_REMOVE
+
+
+if __name__ == "__main__":
+    main()

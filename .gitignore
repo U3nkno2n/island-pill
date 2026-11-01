@@ -1,0 +1,8 @@
+backup/
+__pycache__/
+*.pyc
+.pytest_cache/
+.opencode/
+monitor_ram.log
+monitor_ram.pid
+ram_log.csv
