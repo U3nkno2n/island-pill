@@ -500,5 +500,128 @@ class TestWifiAsyncDiscovery(unittest.TestCase):
         self.assertIsNone(self.win.wdev)
 
 
+class TestOpenCodePermissionHandling(unittest.TestCase):
+    """Host-side OpenCode permission registration and decision flow."""
+
+    def setUp(self):
+        self.win = island_pill.Island.__new__(island_pill.Island)
+        self.win.open = False
+        self.win.pointer_inside = False
+        self.win.peek_on = False
+        self.win.peek = {}
+        self.win.pending_peek = None
+        self.win.pending_permissions = {}
+        self.win._ids = {"open": 0, "close": 0, "peek": 0, "sec": 0}
+        self.win.dl_dir = island_pill.download_dir()
+        self.win.retarget = lambda: None
+        self.win.queue_draw = lambda: None
+        self.win.get_mapped = lambda: False
+        self.win._cancel = lambda key: None
+        self.win._oc_bridge = None
+
+    def test_permission_register_shows_peek_no_autodismiss(self):
+        """Registering a permission shows a peek with secs=None (no auto-dismiss)."""
+        bridge_calls = []
+        self.win._oc_bridge = type("B", (), {
+            "host_decision": lambda self_, pid, decision: bridge_calls.append((pid, decision))
+        })()
+
+        info = {
+            "type": "register",
+            "permission_id": "perm-1",
+            "session": "s1",
+            "project": "myproj",
+            "title": "Edit file.py",
+            "detail": "bash: rm -rf /",
+        }
+
+        # Capture show_peek calls
+        peek_calls = []
+        orig_show_peek = self.win.show_peek
+        self.win.show_peek = lambda kind, title, body="", secs=None, accent=None, app="": \
+            peek_calls.append((kind, title, body, secs, accent, app))
+
+        try:
+            island_pill.HOVER_ONLY = True
+            island_pill.HOVER_ONLY_PEEKS = True
+            self.win._on_opencode_permission_register(info)
+        finally:
+            self.win.show_peek = orig_show_peek
+
+        # Permission registered
+        self.assertIn("perm-1", self.win.pending_permissions)
+        self.assertEqual(self.win.pending_permissions["perm-1"]["title"], "Edit file.py")
+        # Peek shown with secs=None (no auto-dismiss)
+        self.assertEqual(len(peek_calls), 1)
+        self.assertIsNone(peek_calls[0][3])  # secs is None
+
+    def test_opencode_decision_allow_forwards_to_bridge(self):
+        """Clicking Allow forwards the decision to the bridge and shows confirmation."""
+        bridge_calls = []
+        self.win._oc_bridge = type("B", (), {
+            "host_decision": lambda self_, pid, decision: bridge_calls.append((pid, decision))
+        })()
+
+        self.win.pending_permissions["perm-1"] = {
+            "session": "s1", "project": "myproj", "title": "Edit", "detail": "bash"
+        }
+
+        peek_calls = []
+        orig_show_peek = self.win.show_peek
+        self.win.show_peek = lambda kind, title, body="", secs=None, accent=None, app="": \
+            peek_calls.append((kind, title, body, secs, accent, app))
+
+        try:
+            self.win.opencode_decision("perm-1", "allow")
+        finally:
+            self.win.show_peek = orig_show_peek
+
+        # Decision forwarded to bridge
+        self.assertEqual(bridge_calls, [("perm-1", "allow")])
+        # Permission cleared from pending
+        self.assertNotIn("perm-1", self.win.pending_permissions)
+        # Confirmation peek shown
+        self.assertEqual(len(peek_calls), 1)
+        self.assertEqual(peek_calls[0][0], "opencode")
+        self.assertIn("Allowed", peek_calls[0][2])  # body
+
+    def test_opencode_decision_deny_forwards_to_bridge(self):
+        """Clicking Deny forwards the decision to the bridge and shows confirmation."""
+        bridge_calls = []
+        self.win._oc_bridge = type("B", (), {
+            "host_decision": lambda self_, pid, decision: bridge_calls.append((pid, decision))
+        })()
+
+        self.win.pending_permissions["perm-2"] = {
+            "session": "s1", "project": "myproj", "title": "Edit", "detail": "bash"
+        }
+
+        peek_calls = []
+        orig_show_peek = self.win.show_peek
+        self.win.show_peek = lambda kind, title, body="", secs=None, accent=None, app="": \
+            peek_calls.append((kind, title, body, secs, accent, app))
+
+        try:
+            self.win.opencode_decision("perm-2", "deny")
+        finally:
+            self.win.show_peek = orig_show_peek
+
+        self.assertEqual(bridge_calls, [("perm-2", "deny")])
+        self.assertNotIn("perm-2", self.win.pending_permissions)
+        self.assertEqual(len(peek_calls), 1)
+        self.assertEqual(peek_calls[0][0], "opencode-alert")
+        self.assertIn("Denied", peek_calls[0][2])  # body
+
+    def test_opencode_decision_no_bridge(self):
+        """Decision without a bridge doesn't crash."""
+        self.win._oc_bridge = None
+        self.win.pending_permissions["perm-3"] = {
+            "session": "s1", "project": "myproj", "title": "Edit", "detail": "bash"
+        }
+        # Should not raise
+        self.win.opencode_decision("perm-3", "allow")
+        self.assertNotIn("perm-3", self.win.pending_permissions)
+
+
 if __name__ == "__main__":
     unittest.main()

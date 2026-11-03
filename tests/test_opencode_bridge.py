@@ -195,18 +195,13 @@ class TestOpenCodeBridge(unittest.TestCase):
         self.assertEqual(info["title"], "Edit file.py")
         self.assertEqual(info["detail"], "bash: rm -rf /")
 
-    def test_permission_without_reqid_not_registered(self):
-        client = FakeClient()
-        self._handle(client, {
-            "type": "permission",
-            "session": "s1",
-            "title": "No reqid",
-            "ts": 1000.0,
-        })
-        self.assertEqual(len(self.bridge.pending_permissions), 0)
+    def test_permission_registers_and_notifies_host(self):
+        """Permission event registers server-side and notifies host via callback.
+        The bridge does NOT show the peek itself (host renders Allow/Deny)."""
+        called = []
+        self.bridge.register_decision_callback(
+            lambda info: called.append(info))
 
-    def test_permission_peek_not_auto_dismissed(self):
-        """secs=None means host controls lifetime (no auto-dismiss timer)."""
         client = FakeClient()
         self._handle(client, {
             "type": "permission",
@@ -216,9 +211,29 @@ class TestOpenCodeBridge(unittest.TestCase):
             "title": "Edit file.py",
             "ts": 1000.0,
         })
-        # Peek shown with secs=None
-        self.assertEqual(len(self.win.peek_calls), 1)
-        self.assertIsNone(self.win.peek_calls[0][3])  # secs
+
+        # Pending permission registered server-side
+        self.assertIn(("s1", "perm-1"), self.bridge.pending_permissions)
+        # Host callback invoked with full info
+        self.assertEqual(len(called), 1)
+        info = called[0]
+        self.assertEqual(info["type"], "register")
+        self.assertEqual(info["permission_id"], "perm-1")
+        self.assertEqual(info["session"], "s1")
+        self.assertEqual(info["project"], "myproj")
+        self.assertEqual(info["title"], "Edit file.py")
+        # Bridge did NOT show the peek itself (host handles Allow/Deny rendering)
+        self.assertEqual(len(self.win.peek_calls), 0)
+
+    def test_permission_without_reqid_not_registered(self):
+        client = FakeClient()
+        self._handle(client, {
+            "type": "permission",
+            "session": "s1",
+            "title": "No reqid",
+            "ts": 1000.0,
+        })
+        self.assertEqual(len(self.bridge.pending_permissions), 0)
 
     # ------------------------------------------------- decision send -------
 

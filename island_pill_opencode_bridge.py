@@ -397,9 +397,11 @@ class OpenCodeBridge:
                             "detail": body,
                         },
                     )
-                # Permission peeks are not auto-dismissed; they wait for a decision.
-                show = True
-                secs = None  # host controls lifetime via pending state
+                # The host renders the permission peek (with Allow / Deny);
+                # the bridge must not also call _show_peek, which would
+                # overwrite the peek dict (losing permission_id) and
+                # re-enable the auto-dismiss timer.
+                show = False
 
         if show:
             GLib.idle_add(self._show_peek, kind, title, body, secs, accent, project)

@@ -82,6 +82,7 @@ old_still_running=0
 stop_instance || old_still_running=1
 mkdir -p -- "$DIR" "$AUTOSTART_DIR" "$STATE_DIR"
 install -m 0755 "$HERE/island_pill.py" "$DIR/island_pill.py"
+install -m 0644 "$HERE/island_pill_opencode_bridge.py" "$DIR/island_pill_opencode_bridge.py"
 mkdir -p -- "$DIR/island"
 cp -a -- "$HERE/island/." "$DIR/island/"
 
