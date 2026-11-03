@@ -279,3 +279,35 @@ class TestSubscriptionLifecycle:
         assert call[6] == Gio.DBusCallFlags.NONE
         assert call[7] == 2000 and call[8] is None
         assert call[9] == media.on_list_names   # wiring of the async callback
+
+
+class TestAlarmSingleSource:
+    def test_host_resolves_island_audio_play_alarm(self):
+        # Stage 2.1: the host's verbatim play_alarm copy was retired; the
+        # import from island.audio is now the single source of truth.
+        import island_pill
+
+        assert island_pill.play_alarm is island.audio.play_alarm
+
+    def test_timer_done_alarms_without_audio(self, monkeypatch):
+        # The actual timer-end code path (Island.timer_done, island_pill.py),
+        # invoked directly on a bare instance: no GLib timer is scheduled,
+        # nothing is played, and the running app is never touched.
+        import island_pill
+
+        win = island_pill.Island.__new__(island_pill.Island)
+        win.timer_end = 123.0
+        win.timer_mins = 7
+        win.retarget = lambda: None
+        recorded = {"alarm": 0, "peeks": []}
+        monkeypatch.setattr(island_pill, "play_alarm",
+                            lambda: recorded.__setitem__("alarm", recorded["alarm"] + 1))
+        monkeypatch.setattr(win, "show_peek", lambda *a, **k: recorded["peeks"].append((a, k)))
+
+        win.timer_done()
+
+        assert win.timer_end is None
+        assert recorded["alarm"] == 1
+        (args, kwargs), = recorded["peeks"]
+        assert args == ("timer", "Time's up", "7 min timer finished")
+        assert kwargs == {"secs": 10}

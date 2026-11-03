@@ -31,7 +31,6 @@ import fcntl
 import math
 import os
 import signal
-import subprocess
 import sys
 import time
 
@@ -83,7 +82,8 @@ WIN_H = TOP_MARGIN + OPEN_H_MAX + 8
 NET_POLL_SECONDS = 0.5           # faster samples make speed and activity detection more responsive
 DOWNLOAD_CONFIRM_SAMPLES = 4     # 4 x 0.5 s ~= 2 s confirmation window
 DONE_MIN_BYTES = 20 * 1048576    # smaller downloads finish without a "finished" peek
-PARTIAL_EXT = (".part", ".crdownload", ".opdownload", ".download")   # browsers' unfinished files
+# PARTIAL_EXT now lives beside its only consumer, find_partial, in
+# island/sysinfo.py (Stage 2.1).
 
 from island.theme import BLUE, DIM, FAINT, GREEN, ORANGE, WHITE  # noqa: E402
 BLACK = (0, 0, 0, 1) if NOTCH else (0.02, 0.02, 0.02, 1)
@@ -312,146 +312,18 @@ def indeterminate_bar(cr, x, y, w, h, phase, color):
 
 from island.clock import clock_text as _clock_text, fmt_mmss  # noqa: E402
 
-
-def fmt_rate(bps):
-    if bps >= 104857600:
-        return "%d MB/s" % int(bps / 1048576.0)
-    if bps >= 1048576:
-        return "%.1f MB/s" % (bps / 1048576.0)
-    return "%d KB/s" % int(bps / 1024)
-
-
-def fmt_size(n):
-    if n >= 1073741824:
-        return "%.1f GB" % (n / 1073741824.0)
-    if n >= 1048576:
-        return "%d MB" % int(n / 1048576)
-    return "%d KB" % int(n / 1024)
+# The rate/size formatters and the /proc, /sys and download pollers were
+# moved verbatim to island/sysinfo.py (Stage 2.1); the names below are the
+# live values for every host-side reader, monkeypatching island_pill.<name>
+# keeps working for Island methods.
+from island.sysinfo import (  # noqa: E402
+    fmt_rate, fmt_size, download_dir, find_partial, find_temp_file,
+    net_ifaces, read_cpu, read_mem, read_net_rx, read_temp,
+)
 
 
 def clock_text():
     return _clock_text(HOUR24)
-
-
-def play_alarm():
-    wav = "/usr/share/sounds/freedesktop/stereo/alarm-clock-elapsed.oga"
-    cmds = []
-    if os.path.exists(wav):
-        cmds.append(["paplay", wav])
-    cmds.append(["canberra-gtk-play", "-i", "alarm-clock-elapsed"])
-    for cmd in cmds:
-        try:
-            subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            return
-        except OSError:
-            continue
-    Gdk.beep()
-
-
-# ------------------------------------------------------------ system stats ----
-def read_cpu():
-    with open("/proc/stat") as f:
-        v = [int(x) for x in f.readline().split()[1:9]]
-    return v[3] + v[4], sum(v)  # idle, total
-
-
-def read_mem():
-    total = avail = 0
-    with open("/proc/meminfo") as f:
-        for line in f:
-            if line.startswith("MemTotal:"):
-                total = int(line.split()[1])
-            elif line.startswith("MemAvailable:"):
-                avail = int(line.split()[1])
-                break
-    return (total - avail) / 1048576.0, total / 1048576.0  # GiB used, total
-
-
-def find_temp_file():
-    best = None
-    try:
-        for d in sorted(os.listdir("/sys/class/hwmon")):
-            base = "/sys/class/hwmon/" + d
-            try:
-                with open(base + "/name") as f:
-                    name = f.read().strip()
-            except OSError:
-                continue
-            f = base + "/temp1_input"
-            if name in ("k10temp", "coretemp", "zenpower") and os.path.exists(f):
-                return f
-            if name in ("acpitz", "cpu_thermal") and os.path.exists(f) and best is None:
-                best = f
-    except OSError:
-        pass
-    return best
-
-
-def read_temp(path):
-    if not path:
-        return None
-    try:
-        with open(path) as f:
-            return int(f.read()) / 1000.0
-    except (OSError, ValueError):
-        return None
-
-
-def net_ifaces():
-    """Physical network interfaces only. Loopback, bridges, docker and VPN tunnels are virtual
-    (their traffic also crosses a physical interface, so counting them would double it)."""
-    out = []
-    try:
-        for n in os.listdir("/sys/class/net"):
-            if "/virtual/" not in os.path.realpath("/sys/class/net/" + n):
-                out.append(n)
-    except OSError:
-        pass
-    return out
-
-
-def read_net_rx(names):
-    """Bytes received so far on the given interfaces."""
-    total = 0
-    with open("/proc/net/dev") as f:
-        for line in f.readlines()[2:]:
-            name, _, rest = line.partition(":")
-            if name.strip() in names:
-                total += int(rest.split()[0])
-    return total
-
-
-def download_dir():
-    home = os.path.expanduser("~")
-    try:
-        with open(os.path.join(home, ".config", "user-dirs.dirs")) as f:
-            for line in f:
-                if line.startswith("XDG_DOWNLOAD_DIR"):
-                    p = line.split("=", 1)[1].strip().strip('"').replace("$HOME", home)
-                    if p:
-                        return p
-    except OSError:
-        pass
-    return os.path.join(home, "Downloads")
-
-
-def find_partial(dirpath):
-    """Newest unfinished browser download (.part / .crdownload ...) touched in the last 8 s."""
-    best = None
-    now = time.time()
-    try:
-        with os.scandir(dirpath) as it:
-            for e in it:
-                if e.name.endswith(PARTIAL_EXT):
-                    try:
-                        mt = e.stat().st_mtime
-                    except OSError:
-                        continue
-                    if now - mt < 8 and (best is None or mt > best[1]):
-                        best = (e.name, mt)
-    except OSError:
-        return None
-    return os.path.splitext(best[0])[0] if best else None
 
 
 # ------------------------------------------------------------------ island ----
