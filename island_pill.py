@@ -272,6 +272,7 @@ class Island(Gtk.Window):
         self.dl_name = ""
         self.dl_source = ""       # "partial", "reported", or "network"
         self.progress = {}       # app uri -> (fraction, time), from apps that report progress
+        self.pending_permissions = {}  # permission_id -> {session, project, title, detail}
 
         # geometry (animated)
         initial_w, initial_h = self.target()
@@ -316,15 +317,19 @@ class Island(Gtk.Window):
             self.init_downloads()
 
         # ---- OpenCode bridge (guarded; no-op if module is absent) ----
+        self._oc_bridge = None
         try:
             from island_pill_opencode_bridge import attach_opencode_bridge
         except Exception:
             attach_opencode_bridge = None
         if attach_opencode_bridge:
             try:
-                attach_opencode_bridge(self)
+                self._oc_bridge = attach_opencode_bridge(self)
+                if self._oc_bridge:
+                    self._oc_bridge.register_decision_callback(
+                        self._on_opencode_permission_register)
             except Exception:
-                pass
+                self._oc_bridge = None
 
         return GLib.SOURCE_REMOVE
 
@@ -565,6 +570,11 @@ class Island(Gtk.Window):
             self.set_open(False)
             return True
         if self.peek_on:
+            for x, y, w, h, fn in self.hits:
+                if x <= ev.x <= x + w and y <= ev.y <= y + h:
+                    fn()
+                    self.queue_draw()
+                    return True
             self.end_peek()
         else:
             self._cancel("open")
@@ -1047,6 +1057,61 @@ class Island(Gtk.Window):
         self.queue_draw()
         return GLib.SOURCE_REMOVE
 
+    # ---- OpenCode permission handling ----
+    def _on_opencode_permission_register(self, info):
+        """Bridge callback: a new OpenCode permission request has arrived.
+        Register it and show a peek with Allow / Deny controls."""
+        pid = info["permission_id"]
+        self.pending_permissions[pid] = {
+            "session": info.get("session", ""),
+            "project": info.get("project", ""),
+            "title": info.get("title", ""),
+            "detail": info.get("detail", ""),
+        }
+        self.show_peek(
+            "opencode-alert",
+            "OpenCode · %s" % info.get("project", ""),
+            info.get("title", "") + ("\n" + info.get("detail", "") if info.get("detail") else ""),
+            secs=None,
+            accent=ORANGE,
+            app="OC",
+        )
+        # Tag the live peek so draw_peek can render Allow / Deny controls.
+        self.peek["permission_id"] = pid
+        # Permission peeks wait for a decision: cancel any auto-dismiss timer.
+        self._cancel("peek")
+        self._ids["peek"] = 0
+
+    def _on_opencode_permission_decision(self, pid, decision):
+        """Host-side confirmation after the user allows or denies a permission."""
+        self.pending_permissions.pop(pid, None)
+        if decision == "allow":
+            self.show_peek(
+                "opencode",
+                "OpenCode · permission allowed",
+                "Allowed, continuing…",
+                secs=2,
+                accent=GREEN,
+                app="OC",
+            )
+        else:
+            self.show_peek(
+                "opencode-alert",
+                "OpenCode · permission denied",
+                "Denied by you.",
+                secs=2,
+                accent=ORANGE,
+                app="OC",
+            )
+        self.retarget()
+        self.queue_draw()
+
+    def opencode_decision(self, pid, decision):
+        """Called from peek hit targets: forward Allow/Deny to the bridge."""
+        if self._oc_bridge:
+            self._oc_bridge.host_decision(pid, decision)
+        self._on_opencode_permission_decision(pid, decision)
+
     # ---- downloads
     # Two sources, both cheap:
     #  * apps that report progress with the Unity "LauncherEntry" D-Bus signal (it is how
@@ -1346,6 +1411,31 @@ class Island(Gtk.Window):
             draw_text(cr, pk["body"], tx, py + 40, 9, DIM, width=tw)
         else:
             draw_text(cr, pk["title"], tx, cy, 10.5, WHITE, bold=True, width=tw)
+
+        # Permission peeks: render Allow / Deny controls.
+        pid = pk.get("permission_id")
+        if pid and pid in self.pending_permissions and kind == "opencode-alert":
+            bx = px + PEEK_W - 130
+            by = py + PEEK_H - 30
+            bw = 58
+            bh = 24
+            # Allow
+            cr.set_source_rgba(*GREEN)
+            rounded_rect(cr, bx, by, bw, bh, bh / 2.0)
+            cr.fill()
+            draw_text(cr, "Allow", bx + bw / 2.0, by + bh / 2.0, 9,
+                      (0, 0, 0, 1), bold=True, align=1)
+            self.hits.append((bx, by, bw, bh,
+                              lambda *_: self.opencode_decision(pid, "allow")))
+            # Deny
+            dx = bx + bw + 8
+            cr.set_source_rgba(*ORANGE)
+            rounded_rect(cr, dx, by, bw, bh, bh / 2.0)
+            cr.fill()
+            draw_text(cr, "Deny", dx + bw / 2.0, by + bh / 2.0, 9,
+                      (0, 0, 0, 1), bold=True, align=1)
+            self.hits.append((dx, by, bw, bh,
+                              lambda *_: self.opencode_decision(pid, "deny")))
 
     def conn_chip(self, cr, x, cy, label, color, on, icon, fn, maxw=110):
         """Button with an icon and a label (Wi-Fi, Bluetooth). Returns its width."""

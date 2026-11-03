@@ -96,8 +96,11 @@ class OpenCodeBridge:
         self.listen_fd = -1
         self.listen_watch_id = 0
         self.clients = {}  # fileno -> BridgeClient
+        self.control_client = None  # persistent OpenCode plugin connection
         self.last_peek = {}  # dedup key -> timestamp
         self.pending = {}  # sessionID -> set of requestIDs awaiting input
+        self.pending_permissions = {}  # (sessionID, permissionID) -> {project, title, detail, kind}
+        self.decision_callback = None  # host callback: (permissionID, decision) -> None
 
     # ---------------------------------------------------------------- setup ----
 
@@ -231,6 +234,8 @@ class OpenCodeBridge:
     def _client_timeout(self, client):
         client.close()
         self.clients.pop(client.conn.fileno(), None)
+        if self.control_client is client:
+            self.control_client = None
         return False  # GLib.SOURCE_REMOVE
 
     # ------------------------------------------------------------- read -------
@@ -245,16 +250,22 @@ class OpenCodeBridge:
         except OSError:
             client.close()
             self.clients.pop(fd, None)
+            if self.control_client is client:
+                self.control_client = None
             return False
         if not data:
             client.close()
             self.clients.pop(fd, None)
+            if self.control_client is client:
+                self.control_client = None
             return False
 
         client.read_buffer += data
         if len(client.read_buffer) > MAX_MESSAGE:
             client.close()
             self.clients.pop(fd, None)
+            if self.control_client is client:
+                self.control_client = None
             return False
 
         while b"\n" in client.read_buffer:
@@ -282,13 +293,18 @@ class OpenCodeBridge:
         if not isinstance(msg, dict):
             return
         mtype = msg.get("type")
-        if mtype not in ("opencode", "opencode-alert", "opencode-error", "selftest"):
+        if mtype not in (
+            "opencode", "opencode-alert", "opencode-error", "selftest",
+            "control", "started", "working", "done", "failed", "cancelled",
+            "permission",
+        ):
             return
 
         title = str(msg.get("title", ""))[:200]
         body = str(msg.get("body", ""))[:500]
         project = str(msg.get("project", ""))[:100]
         session = str(msg.get("session", ""))[:100]
+        permission_id = str(msg.get("reqid", msg.get("permissionID", "")))[:100]
 
         # Dedup with a per-key TTL, separate from Pill's last_notif.
         key = (mtype, session)
@@ -306,7 +322,14 @@ class OpenCodeBridge:
         kind = "opencode"
         accent = BLUE
         secs = INFO_SECS
-        if mtype == "opencode":
+        if mtype == "control":
+            # Persistent control connection from the OpenCode plugin.  Keep
+            # it open so the bridge can send opencode.decision messages back.
+            self.control_client = client
+            client.is_control = True
+            self._send_ack(client)
+            return
+        elif mtype == "opencode":
             # Suppress while the session is awaiting user input.
             if session and session in self.pending and self.pending[session]:
                 show = False
@@ -322,6 +345,60 @@ class OpenCodeBridge:
             kind = "opencode"
             accent = BLUE
             secs = INFO_SECS
+        elif mtype == "started":
+            kind = "opencode"
+            accent = BLUE
+            secs = INFO_SECS
+            body = body or "OpenCode started working"
+        elif mtype == "working":
+            kind = "opencode"
+            accent = BLUE
+            secs = INFO_SECS
+        elif mtype == "done":
+            kind = "opencode"
+            accent = GREEN
+            secs = INFO_SECS
+            title = title or "OpenCode"
+            body = body or "Response completed"
+        elif mtype == "failed":
+            kind = "opencode-error"
+            accent = ORANGE
+            secs = ERROR_SECS
+            title = title or "OpenCode"
+            body = body or "Request failed"
+        elif mtype == "cancelled":
+            kind = "opencode-error"
+            accent = ORANGE
+            secs = ERROR_SECS
+            title = title or "OpenCode"
+            body = body or "Request cancelled"
+        elif mtype == "permission":
+            kind = "opencode-alert"
+            accent = ORANGE
+            secs = ALERT_SECS
+            # Register pending permission so the host can render Allow/Deny.
+            if session and permission_id:
+                self.pending_permissions[(session, permission_id)] = {
+                    "project": project,
+                    "title": title,
+                    "detail": body,
+                }
+                # Notify host so it can render the permission peek.
+                if self.decision_callback:
+                    GLib.idle_add(
+                        self.decision_callback,
+                        {
+                            "type": "register",
+                            "permission_id": permission_id,
+                            "session": session,
+                            "project": project,
+                            "title": title,
+                            "detail": body,
+                        },
+                    )
+                # Permission peeks are not auto-dismissed; they wait for a decision.
+                show = True
+                secs = None  # host controls lifetime via pending state
 
         if show:
             GLib.idle_add(self._show_peek, kind, title, body, secs, accent, project)
@@ -386,6 +463,8 @@ class OpenCodeBridge:
         except OSError:
             client.close()
             self.clients.pop(fd, None)
+            if self.control_client is client:
+                self.control_client = None
             return False
         # Queue drained.
         if client.write_watch_id:
@@ -396,6 +475,54 @@ class OpenCodeBridge:
             client.write_watch_id = 0
         return False  # GLib.SOURCE_REMOVE
 
+
+    # ------------------------------------------------------------- decision ----
+
+    def register_decision_callback(self, cb):
+        """Register a host callback invoked when a permission is registered.
+        Signature: cb(info) where info is a dict with keys:
+        type="register", permission_id, project, title, detail."""
+        self.decision_callback = cb
+
+    def _send_decision(self, session, permission_id, decision):
+        """Send an opencode.decision message to the OpenCode plugin over the
+        persistent control connection so it can resolve its permission.ask
+        hook with allow/deny/ask."""
+        if self.control_client is None or not self.control_client.active:
+            return False
+        msg = {
+            "v": 1,
+            "type": "opencode.decision",
+            "session": session,
+            "reqid": permission_id,
+            "decision": decision,
+            "ts": time.monotonic(),
+        }
+        self.control_client.write_queue.append(
+            (json.dumps(msg) + "\n").encode("utf-8"))
+        self._try_write(self.control_client)
+        return True
+
+    def _resolve_pending(self, session, permission_id, decision):
+        """Clear a pending permission entry."""
+        self.pending_permissions.pop((session, permission_id), None)
+
+    def host_decision(self, permission_id, decision):
+        """Called by the GTK host when the user clicks Allow or Deny on a
+        permission peek.  Sends opencode.decision to the OpenCode plugin and
+        clears the pending entry."""
+        # Find the session for this permission_id.
+        session = None
+        for (s, pid), entry in self.pending_permissions.items():
+            if pid == permission_id:
+                session = s
+                break
+        if session is None:
+            return False
+        ok = self._send_decision(session, permission_id, decision)
+        if ok:
+            self._resolve_pending(session, permission_id, decision)
+        return ok
 
 def attach_opencode_bridge(win, socket_path=None):
     """Create and start the bridge.  Returns the bridge or None on failure."""
