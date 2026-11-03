@@ -28,10 +28,8 @@ Animation frames only run while the pill is actually moving.
 Right-click the pill for the Quit menu.
 """
 import fcntl
-import html
 import math
 import os
-import re
 import signal
 import subprocess
 import sys
@@ -53,24 +51,21 @@ from gi.repository import Gdk, Gio, GLib, Gtk, Pango, PangoCairo  # noqa: E402
 import cairo  # noqa: E402
 
 # ---- settings you may want to change ---------------------------------------
-HOUR24 = False            # False: 10:24 PM    True: 22:24
-STYLE = os.environ.get("ISLAND_PILL_STYLE", "pill")
-#   "pill":  a detached, floating pill with a gap above it (default)
-#   "notch": hangs from the very top edge with flared corners
-FONT = "Sans"
-TIMER_PRESETS = (5, 10, 25)   # minutes, shown as buttons in the open view
-PEEK_SECONDS = 4          # how long a peek stays out
-HOVER_OPEN_DELAY_MS = 5000 # hover this long before opening the full controls; click opens instantly
-SHOW_NOTIFICATIONS = True # peek on desktop notifications
-LOW_BATTERY = (20, 10)    # warn when the battery falls below these percentages
-SHOW_DOWNLOADS = True     # speed + progress bar while something downloads (False: no polling at all)
-DOWNLOAD_MIN_KBPS = 1200  # fallback threshold, KB/s; used only if network fallback is enabled
-DOWNLOAD_NETWORK_FALLBACK = False  # avoids mistaking video/music streaming for file downloads
-DOWNLOAD_DONE_PEEK = True # peek "Download finished" when a download of 20 MB or more ends
-SHOW_WIFI = True          # Wi-Fi button in the open card, peek on connect / disconnect
-HOVER_ONLY = True         # keep the island visually quiet; reveal/expand content only on hover
-HOVER_ONLY_PEEKS = True   # allow brief peeks (battery, downloads, Wi-Fi, etc.) even in quiet mode
+# The settings block moved verbatim to island/settings.py (Stage 2). The
+# names below are the live values for every host-side reader; mutating
+# island_pill.<name> at runtime keeps working for island_pill consumers.
+from island.settings import (  # noqa: E402
+    DOWNLOAD_DONE_PEEK, DOWNLOAD_MIN_KBPS, DOWNLOAD_NETWORK_FALLBACK,
+    FONT, HOVER_ONLY, HOVER_ONLY_PEEKS, HOVER_OPEN_DELAY_MS, HOUR24, LOW_BATTERY,
+    PEEK_SECONDS, SHOW_DOWNLOADS, SHOW_NOTIFICATIONS, SHOW_WIFI, STYLE,
+    TIMER_PRESETS,
+)
 # -----------------------------------------------------------------------------
+# Pure peek helpers moved verbatim to island/peek.py (Stage 2); the host
+# keeps all peek state and timers.
+from island.peek import (  # noqa: E402
+    clean_notif_text, is_duplicate_notif, peek_queue_payload, should_show_peek,
+)
 
 NOTCH = STYLE != "pill"
 TOP_MARGIN = 0 if NOTCH else 8   # visible gap between screen edge and floating pill (px)
@@ -93,9 +88,11 @@ PARTIAL_EXT = (".part", ".crdownload", ".opdownload", ".download")   # browsers'
 from island.theme import BLUE, DIM, FAINT, GREEN, ORANGE, WHITE  # noqa: E402
 BLACK = (0, 0, 0, 1) if NOTCH else (0.02, 0.02, 0.02, 1)
 
-MPRIS = "org.mpris.MediaPlayer2"
-MPRIS_PATH = "/org/mpris/MediaPlayer2"
-MPRIS_PLAYER = "org.mpris.MediaPlayer2.Player"
+# MPRIS identifiers and the media/alarm machinery moved verbatim to
+# island/audio.py (Stage 2); these names stay for compatibility.
+from island.audio import (  # noqa: E402
+    MPRIS, MPRIS_PATH, MPRIS_PLAYER, MediaPlayer, play_alarm,
+)
 
 NM = "org.freedesktop.NetworkManager"
 NM_PATH = "/org/freedesktop/NetworkManager"
@@ -492,7 +489,7 @@ class Island(Gtk.Window):
         self.hits = []
         self.timer_end = None
         self.timer_mins = 0
-        self.players = {}
+        self._media = MediaPlayer(self)   # MPRIS tracker; host = self
         self.batt_pct = None
         self.batt_state = None
         self.cpu_pct = None
@@ -759,20 +756,15 @@ class Island(Gtk.Window):
         self.retarget()
         self.queue_draw()
 
-    def show_peek(self, kind, title, body="", secs=PEEK_SECONDS, accent=None, app=""):
+    def show_peek(self, kind, title, body="", secs=None, accent=None, app=""):
+        if secs is None:
+            secs = PEEK_SECONDS        # read at call time: hand-edit friendly
         if self.open:
             # The expanded card is showing: queue the event so it can surface
             # when the card closes instead of being silently discarded.
-            self.pending_peek = {
-                "kind": kind,
-                "title": title,
-                "body": body,
-                "secs": secs,
-                "accent": accent,
-                "app": app,
-            }
+            self.pending_peek = peek_queue_payload(kind, title, body, secs, accent, app)
             return
-        if not HOVER_ONLY_PEEKS:
+        if not should_show_peek(self.open, HOVER_ONLY_PEEKS):
             return
         self.peek = dict(kind=kind, title=title, body=body, accent=accent, app=app)
         self.peek_on = True
@@ -942,96 +934,23 @@ class Island(Gtk.Window):
         self.show_peek("timer", "Time's up", "%d min timer finished" % self.timer_mins, secs=10)
         self.retarget()
 
-    # ---- media (MPRIS over D-Bus)
+    # ---- media (MPRIS over D-Bus; logic extracted verbatim to
+    # island.audio.MediaPlayer in Stage 2 — same subscriptions, callbacks,
+    # player-selection priority and announcement path. Public names delegate.)
     def init_mpris(self):
-        self.bus.signal_subscribe(
-            None, "org.freedesktop.DBus.Properties", "PropertiesChanged", MPRIS_PATH,
-            MPRIS_PLAYER, Gio.DBusSignalFlags.NONE, self.on_mpris_signal)
-        self.bus.signal_subscribe(
-            "org.freedesktop.DBus", "org.freedesktop.DBus", "NameOwnerChanged",
-            "/org/freedesktop/DBus", None, Gio.DBusSignalFlags.NONE, self.on_name_owner)
-        self.bus.call("org.freedesktop.DBus", "/org/freedesktop/DBus", "org.freedesktop.DBus",
-                      "ListNames", None, GLib.VariantType("(as)"), Gio.DBusCallFlags.NONE,
-                      2000, None, self.on_list_names)
-
-    def on_list_names(self, bus, res):
-        try:
-            names = bus.call_finish(res).unpack()[0]
-        except GLib.Error:
-            return
-        for name in names:
-            if name.startswith(MPRIS + "."):
-                bus.call("org.freedesktop.DBus", "/org/freedesktop/DBus", "org.freedesktop.DBus",
-                         "GetNameOwner", GLib.Variant("(s)", (name,)), GLib.VariantType("(s)"),
-                         Gio.DBusCallFlags.NONE, 2000, None, self.on_owner)
-
-    def on_owner(self, bus, res):
-        try:
-            owner = bus.call_finish(res).unpack()[0]
-        except GLib.Error:
-            return
-        bus.call(owner, MPRIS_PATH, "org.freedesktop.DBus.Properties", "GetAll",
-                 GLib.Variant("(s)", (MPRIS_PLAYER,)), GLib.VariantType("(a{sv})"),
-                 Gio.DBusCallFlags.NONE, 2000, None, self.on_getall, owner)
-
-    def on_getall(self, bus, res, owner):
-        try:
-            props = bus.call_finish(res).unpack()[0]
-        except GLib.Error:
-            return
-        self.update_player(owner, props, announce=False)
-
-    def on_mpris_signal(self, conn, sender, path, iface, signal_name, params, *_):
-        self.update_player(sender, params.unpack()[1], announce=True)
-
-    def on_name_owner(self, conn, sender, path, iface, signal_name, params, *_):
-        name, old, new = params.unpack()
-        if name.startswith(MPRIS + ".") and not new and old in self.players:
-            del self.players[old]
-            self.retarget()
-            self.queue_draw()
+        self._media.init_mpris(self.bus)
 
     def update_player(self, sender, props, announce=True):
-        p = self.players.setdefault(sender, dict(status="Stopped", title="", artist="", t=0.0))
-        old_title = p["title"]
-        if "PlaybackStatus" in props:
-            p["status"] = props["PlaybackStatus"]
-        if "Metadata" in props:
-            md = props["Metadata"]
-            artist = md.get("xesam:artist", "")
-            if isinstance(artist, (list, tuple)):
-                artist = ", ".join(artist)
-            p["title"] = md.get("xesam:title", "") or ""
-            p["artist"] = artist or md.get("xesam:album", "") or ""
-        p["t"] = time.monotonic()
-        if (announce and p["status"] == "Playing" and p["title"]
-                and p["title"] != old_title and self.current_player()
-                and self.current_player()[0] == sender):
-            self.show_peek("music", p["title"], p["artist"])
-        self.retarget()
-        if self.media_playing() and (self.pointer_inside or self.open):
-            self.ensure_visual_tick()
-        self.queue_draw()
+        self._media.update_player(sender, props, announce)
 
     def current_player(self):
-        best = None
-        for sender, p in self.players.items():
-            if p["status"] == "Stopped" or not (p["title"] or p["status"] == "Playing"):
-                continue
-            key = (p["status"] == "Playing", p["t"])
-            if best is None or key > best[0]:
-                best = (key, sender, p)
-        return (best[1], best[2]) if best else None
+        return self._media.current_player()
 
     def media_playing(self):
-        cur = self.current_player()
-        return bool(cur and cur[1]["status"] == "Playing")
+        return self._media.media_playing()
 
     def mpris_call(self, method):
-        cur = self.current_player()
-        if cur and self.bus:
-            self.bus.call(cur[0], MPRIS_PATH, MPRIS_PLAYER, method, None, None,
-                          Gio.DBusCallFlags.NONE, 2000, None, None)
+        self._media.mpris_call(method)
 
     # ---- lightweight visual animation (active only during a transition/download)
     def ensure_visual_tick(self):
@@ -1652,12 +1571,11 @@ class Island(Gtk.Window):
         return None
 
     def on_notify(self, app, summary, body):
-        clean = lambda s: html.unescape(re.sub(r"<[^>]+>", "", s or "")).replace("\n", " ").strip()
-        summary, body = clean(summary), clean(body)
+        summary, body = clean_notif_text(summary), clean_notif_text(body)
         if not summary and not body:
             return GLib.SOURCE_REMOVE
         now = time.monotonic()
-        if self.last_notif[0] == summary + "\0" + body and now - self.last_notif[1] < 2:
+        if is_duplicate_notif(self.last_notif, now, summary, body):
             return GLib.SOURCE_REMOVE
         self.last_notif = (summary + "\0" + body, now)
         self.show_peek("notify", summary or app, body if summary else "", secs=5, app=app)
