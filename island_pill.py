@@ -321,6 +321,14 @@ from island.sysinfo import (  # noqa: E402
     net_ifaces, read_cpu, read_mem, read_net_rx, read_temp,
 )
 
+# Pure animation math and the mode/size decision matrix moved out verbatim
+# (Stage 3); all scheduling, timers, dt bookkeeping and state write-backs
+# stay host-side.
+from island.anim import (  # noqa: E402
+    spring_axis, advance_music, advance_dl_phase, advance_charge, ease_battery,
+)
+from island.state_model import decide_mode, size_for
+
 
 def clock_text():
     return _clock_text(HOUR24)
@@ -550,15 +558,17 @@ class Island(Gtk.Window):
                 + (ROW_DL_H if self.dl_active else 0))
 
     def target(self):
-        if self.open:
-            return OPEN_W, self.open_h()
-        if self.peek_on:
-            return PEEK_W, PEEK_H
-        if HOVER_ONLY and not self.pointer_inside and not self.activity_visible():
-            return 1, 1
-        if HOVER_ONLY and not self.pointer_inside:
-            return self.idle_target_w(), self.idle_target_h()
-        return self.idle_target_w(), self.idle_target_h()
+        # Guard order and the activity short-circuit live in
+        # island.state_model.decide_mode; sizes in size_for with lazy
+        # dimension thunks, so open_h()/idle_target_*() are called exactly
+        # when the original branch structure called them.
+        return size_for(
+            decide_mode(self.open, self.peek_on, self.pointer_inside,
+                        self.activity_visible, HOVER_ONLY),
+            open_dims=lambda: (OPEN_W, self.open_h()),
+            idle_dims=lambda: (self.idle_target_w(), self.idle_target_h()),
+            peek_dims=lambda: (PEEK_W, PEEK_H),
+        )
 
     def retarget(self):
         if not self.get_mapped():
@@ -574,14 +584,10 @@ class Island(Gtk.Window):
         self.last_t = t
         tw, th = self.target()
         settled = True
-        k, d = 220.0, 31.0  # softer damped spring for a smoother, less snappy resize
         for name, tgt in (("w", tw), ("h", th)):
             cur, v = getattr(self, name), getattr(self, "v" + name)
-            v += (k * (tgt - cur) - d * v) * dt
-            cur += v * dt
-            if abs(tgt - cur) < 0.3 and abs(v) < 2.0:
-                cur, v = float(tgt), 0.0
-            else:
+            cur, v, axis_settled = spring_axis(cur, v, tgt, dt)
+            if not axis_settled:
                 settled = False
             setattr(self, name, max(8.0, cur))
             setattr(self, "v" + name, v)
@@ -832,26 +838,19 @@ class Island(Gtk.Window):
     def on_visual_tick(self):
         active = False
         if self.media_playing() and (not HOVER_ONLY or self.pointer_inside or self.open):
-            self.music_phase = (self.music_phase + 0.22) % (2 * math.pi)
+            self.music_phase = advance_music(self.music_phase)
             active = True
         if self.dl_active and self.dl_fraction() is None and (not HOVER_ONLY or self.pointer_inside or self.open):
-            self.dl_phase += 0.018 * self.dl_phase_dir
-            if self.dl_phase >= 1.0:
-                self.dl_phase, self.dl_phase_dir = 1.0, -1.0
-            elif self.dl_phase <= 0.0:
-                self.dl_phase, self.dl_phase_dir = 0.0, 1.0
+            self.dl_phase, self.dl_phase_dir = advance_dl_phase(self.dl_phase, self.dl_phase_dir)
             active = True
         if self.charge_flash:
-            self.charge_phase = (self.charge_phase + 0.045) % 1.0
+            self.charge_phase = advance_charge(self.charge_phase)
             active = True
         if self.batt_draw_pct is not None and self.batt_target_pct is not None:
-            diff = self.batt_target_pct - self.batt_draw_pct
-            if abs(diff) > 0.15:
-                # Exponential easing is smooth and doesn't overshoot the actual percentage.
-                self.batt_draw_pct += diff * 0.20
+            self.batt_draw_pct, batt_active = ease_battery(
+                self.batt_draw_pct, self.batt_target_pct)
+            if batt_active:
                 active = True
-            else:
-                self.batt_draw_pct = self.batt_target_pct
         if active:
             self.queue_draw()
             return GLib.SOURCE_CONTINUE
