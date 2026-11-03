@@ -142,6 +142,17 @@ from island.anim import (  # noqa: E402
 )
 from island.state_model import decide_mode, size_for
 
+# All GLib timeout/source_remove call sites route through island.scheduler
+# (Stage 5): pure pass-through primitives, ids returned untouched, callback
+# return protocol owned by GLib. The minute-alignment expression
+# 61 - time.localtime().tm_sec and every settings-sourced cadence read stay
+# verbatim at their host call sites.
+from island.scheduler import (  # noqa: E402
+    once, loop_ms, loop_seconds, cancel,
+    SEC_TICK_S, VISUAL_TICK_MS, CLOSE_HYSTERESIS_MS, CHARGE_FLASH_MS,
+    NOTE_CLEAR_MS,
+)
+
 
 def clock_text():
     return _clock_text(HOUR24)
@@ -414,7 +425,7 @@ class Island(Gtk.Window):
     # ---- small timer helpers
     def _cancel(self, key):
         if self._ids[key]:
-            GLib.source_remove(self._ids[key])
+            cancel(self._ids[key])
             self._ids[key] = 0
 
     # ---- open / close / peek
@@ -460,7 +471,7 @@ class Island(Gtk.Window):
         self.peek = dict(kind=kind, title=title, body=body, accent=accent, app=app)
         self.peek_on = True
         self._cancel("peek")
-        self._ids["peek"] = GLib.timeout_add(int(secs * 1000), self._peek_timeout)
+        self._ids["peek"] = once(int(secs * 1000), self._peek_timeout)
         self.retarget()
         self.queue_draw()
 
@@ -485,14 +496,14 @@ class Island(Gtk.Window):
         if self.media_playing() or self.batt_state in (1, 5) or self.dl_active:
             self.ensure_visual_tick()
         if not self.open and not self._ids["open"]:
-            self._ids["open"] = GLib.timeout_add(HOVER_OPEN_DELAY_MS, self._do_open)
+            self._ids["open"] = once(HOVER_OPEN_DELAY_MS, self._do_open)
         self.queue_draw()
         return False
 
     def on_leave(self, widget, ev):
         self._cancel("open")
         if self.open and not self._ids["close"]:
-            self._ids["close"] = GLib.timeout_add(350, self._do_close)
+            self._ids["close"] = once(CLOSE_HYSTERESIS_MS, self._do_close)
         elif not self.open:
             self.pointer_inside = False
             self.retarget()
@@ -541,7 +552,7 @@ class Island(Gtk.Window):
     # ---- once-a-second work (only while open or a timer is running)
     def ensure_sec(self):
         if (self.open or self.timer_end is not None) and not self._ids["sec"]:
-            self._ids["sec"] = GLib.timeout_add_seconds(1, self.on_sec)
+            self._ids["sec"] = loop_seconds(SEC_TICK_S, self.on_sec)
 
     def on_sec(self):
         if not (self.open or self.timer_end is not None):
@@ -589,12 +600,12 @@ class Island(Gtk.Window):
         wx, wy = gw.get_origin()
         x, y, w, h = self.pill_rect()
         if not (wx + x - 10 <= px <= wx + x + w + 10 and py <= wy + y + h + 10):
-            self._ids["close"] = GLib.timeout_add(350, self._do_close)
+            self._ids["close"] = once(CLOSE_HYSTERESIS_MS, self._do_close)
 
     # ---- clock
     def schedule_clock(self):
         self._clock = clock_text()
-        self._clock_id = GLib.timeout_add_seconds(61 - time.localtime().tm_sec, self.on_clock)
+        self._clock_id = loop_seconds(61 - time.localtime().tm_sec, self.on_clock)
 
     def on_clock(self):
         self.schedule_clock()
@@ -646,7 +657,7 @@ class Island(Gtk.Window):
     # ---- lightweight visual animation (active only during a transition/download)
     def ensure_visual_tick(self):
         if not self.visual_id:
-            self.visual_id = GLib.timeout_add(33, self.on_visual_tick)
+            self.visual_id = loop_ms(VISUAL_TICK_MS, self.on_visual_tick)
 
     def on_visual_tick(self):
         active = False
@@ -695,8 +706,8 @@ class Island(Gtk.Window):
     def start_charge_flash(self):
         self.charge_flash = True
         if self.charge_flash_id:
-            GLib.source_remove(self.charge_flash_id)
-        self.charge_flash_id = GLib.timeout_add(2200, self.end_charge_flash)
+            cancel(self.charge_flash_id)
+        self.charge_flash_id = once(CHARGE_FLASH_MS, self.end_charge_flash)
         self.ensure_visual_tick()
         self.retarget()
         self.queue_draw()
@@ -847,7 +858,7 @@ class Island(Gtk.Window):
             bus.call_finish(res)
         except GLib.Error as e:
             self.bt_note = "Blocked" if "rfkill" in e.message.lower() else "Failed"
-            GLib.timeout_add(3000, self.clear_bt_note)
+            once(NOTE_CLEAR_MS, self.clear_bt_note)
             self.queue_draw()
 
     def clear_bt_note(self):
@@ -1052,7 +1063,7 @@ class Island(Gtk.Window):
 
     def wifi_flash(self, text):
         self.wifi_note = text
-        GLib.timeout_add(3000, self.clear_wifi_note)
+        once(NOTE_CLEAR_MS, self.clear_wifi_note)
         self.queue_draw()
 
     def clear_wifi_note(self):
@@ -1112,7 +1123,7 @@ class Island(Gtk.Window):
 
     def init_downloads(self):
         self.net_ifs = set(net_ifaces())
-        GLib.timeout_add(max(100, int(NET_POLL_SECONDS * 1000)), self.on_net)
+        loop_ms(max(100, int(NET_POLL_SECONDS * 1000)), self.on_net)
 
     def on_net(self):
         now = time.monotonic()
@@ -1565,7 +1576,7 @@ def main():
     GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, signal.SIGTERM, quit_cb)
     win.show_all()
     win.place()
-    GLib.timeout_add_seconds(3, release_startup_memory)
+    loop_seconds(3, release_startup_memory)
     Gtk.main()
 
 
