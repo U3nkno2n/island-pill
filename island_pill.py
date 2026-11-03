@@ -165,6 +165,16 @@ from island.device_state import (  # noqa: E402
     wifi_summary,
 )
 
+# The download confirmation machine (Stage 8): per-sample rate math, the
+# hit/low counter evolution and the source decision live in island/download.py,
+# returned as an (updates, action) protocol applied by on_net() in the
+# original write order. dl_start/dl_stop stay untouched host methods and are
+# invoked at their original call sites; every scan, poll, LauncherEntry D-Bus
+# task and all draw/peek/sizing effects stay host-side.
+from island.download import (  # noqa: E402
+    download_sample, download_decide, progress_scan, dl_bar_pair,
+)
+
 
 def clock_text():
     return _clock_text(HOUR24)
@@ -1070,22 +1080,14 @@ class Island(Gtk.Window):
     def dl_fraction(self):
         """Progress 0..1 reported by an app, or None."""
         now = time.monotonic()
-        best = None
-        for app, (frac, t) in list(self.progress.items()):
-            if now - t > 30:            # app stopped updating (closed, crashed)
-                del self.progress[app]
-            elif best is None or frac > best:
-                best = frac
+        best, stale = progress_scan(self.progress, now)
+        for app in stale:
+            del self.progress[app]
         return best
 
     def dl_bar(self):
         """(fill 0..1, colour, is it a real percentage)"""
-        frac = self.dl_fraction()
-        if frac is not None:
-            return frac, GREEN, True
-        # Firefox exposes no reliable system-wide file total/progress signal here. Do not
-        # disguise network speed as a completion percentage: use a moving indeterminate bar.
-        return None, BLUE, False
+        return dl_bar_pair(self.dl_fraction())
 
     def init_downloads(self):
         self.net_ifs = set(net_ifaces())
@@ -1100,15 +1102,10 @@ class Island(Gtk.Window):
             rx = read_net_rx(self.net_ifs)
         except (OSError, ValueError):
             return GLib.SOURCE_CONTINUE
-        prev, self.net_prev = self.net_prev, (now, rx)
-        if prev is None or now - prev[0] > 30:     # first sample, or the laptop was asleep
-            self.dl_rate = None
+        self.net_prev, self.dl_rate, inst, delta, skip = download_sample(
+            self.net_prev, self.dl_rate, now, rx)
+        if skip:          # first sample, or the laptop was asleep
             return GLib.SOURCE_CONTINUE
-        dt = now - prev[0]
-        delta = max(0, rx - prev[1])
-        inst = delta / dt
-        self.dl_rate = inst if self.dl_rate is None else 0.5 * self.dl_rate + 0.5 * inst
-        thr = DOWNLOAD_MIN_KBPS * 1024.0
         reported = self.dl_fraction() is not None
         # Only scan the Downloads dir for unfinished browser files when there is
         # incoming traffic or we are already tracking a download. Scanning every
@@ -1116,45 +1113,24 @@ class Island(Gtk.Window):
         partial = None
         if self.dl_active or inst > 1024.0:
             partial = find_partial(self.dl_dir)
-        network_candidate = DOWNLOAD_NETWORK_FALLBACK and inst >= thr
-        if not self.dl_active:
-            # Prefer direct evidence: an unfinished browser file or an app progress signal.
-            # Generic RX traffic is ambiguous (video streams, calls, game updates), so it is
-            # deliberately opt-in rather than causing false "Downloading" states by default.
-            if partial or reported or network_candidate:
-                self.dl_hits += 1
-                self.dl_pending += delta
-            else:
-                self.dl_hits, self.dl_pending = 0, 0
-            if reported or self.dl_hits >= DOWNLOAD_CONFIRM_SAMPLES:
-                self.dl_start(source=("reported" if reported else
-                                      "partial" if partial else "network"))
-        else:
-            self.dl_bytes += delta
-            self.dl_peak = max(self.dl_peak, self.dl_rate or 0.0)
-            # If the download was identified by a browser temp file, unrelated network traffic
-            # must not keep it alive after that file disappears. Progress-reported tasks are
-            # governed by their own signal and a short stale-signal grace period.
-            if self.dl_source == "partial":
-                evidence = bool(partial) or reported
-                low_limit = 4
-            elif self.dl_source == "reported":
-                evidence = reported
-                low_limit = 6
-            else:
-                evidence = network_candidate
-                low_limit = 6
-            if evidence:
-                self.dl_lows = 0
-            else:
-                self.dl_lows += 1
-            if self.dl_lows >= low_limit:
-                self.dl_stop()
-            else:
-                name = partial
-                if name and name != self.dl_name:
-                    self.dl_name = name
-                    self.retarget()
+        updates, action = download_decide(
+            {"active": self.dl_active, "source": self.dl_source,
+             "hits": self.dl_hits, "lows": self.dl_lows,
+             "pending": self.dl_pending, "bytes": self.dl_bytes,
+             "peak": self.dl_peak, "name": self.dl_name, "rate": self.dl_rate},
+            delta, inst, partial, reported,
+            DOWNLOAD_NETWORK_FALLBACK, DOWNLOAD_MIN_KBPS,
+            DOWNLOAD_CONFIRM_SAMPLES)
+        for field, value in updates:
+            setattr(self, "dl_" + field, value)
+        if action is None:
+            pass
+        elif action[0] == "start":
+            self.dl_start(action[1])
+        elif action[0] == "stop":
+            self.dl_stop()
+        elif action[0] == "rename":
+            self.retarget()
         if self.dl_active and self.dl_fraction() is None:
             self.ensure_visual_tick()
         if self.dl_active or self.open:
