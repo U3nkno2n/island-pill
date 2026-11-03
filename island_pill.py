@@ -90,12 +90,7 @@ DOWNLOAD_CONFIRM_SAMPLES = 4     # 4 x 0.5 s ~= 2 s confirmation window
 DONE_MIN_BYTES = 20 * 1048576    # smaller downloads finish without a "finished" peek
 PARTIAL_EXT = (".part", ".crdownload", ".opdownload", ".download")   # browsers' unfinished files
 
-WHITE = (1, 1, 1, 1)
-DIM = (1, 1, 1, 0.55)
-FAINT = (1, 1, 1, 0.12)
-GREEN = (0.20, 0.84, 0.45, 1)
-ORANGE = (1.0, 0.62, 0.10, 1)
-BLUE = (0.35, 0.62, 1.0, 1)
+from island.theme import BLUE, DIM, FAINT, GREEN, ORANGE, WHITE  # noqa: E402
 BLACK = (0, 0, 0, 1) if NOTCH else (0.02, 0.02, 0.02, 1)
 
 MPRIS = "org.mpris.MediaPlayer2"
@@ -318,8 +313,7 @@ def indeterminate_bar(cr, x, y, w, h, phase, color):
     cr.fill()
     cr.restore()
 
-def fmt_mmss(secs):
-    return "%d:%02d" % (secs // 60, secs % 60)
+from island.clock import clock_text as _clock_text, fmt_mmss  # noqa: E402
 
 
 def fmt_rate(bps):
@@ -339,9 +333,7 @@ def fmt_size(n):
 
 
 def clock_text():
-    if HOUR24:
-        return time.strftime("%H:%M")
-    return time.strftime("%I:%M %p").lstrip("0")
+    return _clock_text(HOUR24)
 
 
 def play_alarm():

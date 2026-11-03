@@ -82,6 +82,8 @@ old_still_running=0
 stop_instance || old_still_running=1
 mkdir -p -- "$DIR" "$AUTOSTART_DIR" "$STATE_DIR"
 install -m 0755 "$HERE/island_pill.py" "$DIR/island_pill.py"
+mkdir -p -- "$DIR/island"
+cp -a -- "$HERE/island/." "$DIR/island/"
 
 # Keep logs available for troubleshooting instead of silently discarding errors.
 cat > "$DIR/run.sh" <<EOF
