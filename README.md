@@ -12,6 +12,9 @@ A lightweight, GTK 3 Dynamic Island-style desktop widget for Linux Mint Cinnamon
 - Optional notification peeks
 - Download row with speed and an indeterminate progress animation when a reliable total is unavailable
 - Hover-to-open controls (5 seconds by default), click-to-open, and right-click-to-quit
+- OpenCode integration: activity peeks (started, working, done, failed, cancelled)
+  and permission requests with functional Allow / Deny controls that reach the
+  correct OpenCode request via the Unix socket bridge
 
 ## Download detection and false positives
 
@@ -80,6 +83,27 @@ Edit the settings block near the top of `island_pill.py`, then rerun `bash insta
 - `DOWNLOAD_DONE_PEEK` — show a completion peek for sufficiently large detected transfers
 - `HOVER_ONLY_PEEKS` — allow brief event peeks (battery low, download finished, Wi-Fi, Bluetooth, notifications) even while the island is quiet; default `True`
 - `SHOW_WIFI` — enable/disable Wi-Fi controls and peeks
+
+## OpenCode integration
+
+Island Pill integrates with OpenCode (version 1.19.5) via a Unix domain socket
+bridge at `$XDG_RUNTIME_DIR/island-pill.sock`. Install the global plugin
+(`island-pill-notify.js`) into `~/.config/opencode/plugins/` and the bridge is
+activated automatically when Island Pill starts.
+
+The bridge displays:
+
+- **Activity peeks**: session started, working, response finished (done), failed, cancelled
+- **Permission requests**: Allow / Deny controls that resolve OpenCode's
+  `permission.ask` hook with the user's decision
+- **Questions**: displayed informationally (OpenCode v1 has no plugin hook to
+  answer questions from the island)
+
+Permission requests remain pending until the user allows or denies, the request
+times out (30 s), or the bridge disconnects — at which point OpenCode falls
+back to its normal terminal prompt. Multiple sessions and multiple pending
+requests are tracked independently.
+
 
 ## Resource use
 

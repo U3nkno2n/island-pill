@@ -46,6 +46,7 @@ ERROR_SECS = 10
 WHITE = (1, 1, 1, 1)
 BLUE = (0.35, 0.62, 1.0, 1)
 ORANGE = (1.0, 0.62, 0.10, 1)
+GREEN = (0.20, 0.84, 0.45, 1)
 
 
 class BridgeClient:
@@ -301,7 +302,7 @@ class OpenCodeBridge:
             return
 
         title = str(msg.get("title", ""))[:200]
-        body = str(msg.get("body", ""))[:500]
+        body = str(msg.get("body", msg.get("detail", "")))[:500]
         project = str(msg.get("project", ""))[:100]
         session = str(msg.get("session", ""))[:100]
         permission_id = str(msg.get("reqid", msg.get("permissionID", "")))[:100]

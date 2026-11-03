@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.2.0 — OpenCode integration
+
+- Added OpenCode activity peeks: session started, working, done, failed, cancelled
+- Added OpenCode permission requests with functional Allow / Deny controls that
+  resolve OpenCode's `permission.ask` hook via the Unix socket bridge
+- Bridge maintains a persistent control connection for decision messages
+- Permission requests time out after 30 s, falling back to OpenCode's normal prompt
+- Multiple sessions and pending requests tracked independently
+- Added 18 headless tests for the bridge protocol
+
 ## 1.1.2 — Download detection race fix and startup hardening
 
 - Fixed `find_partial()` mid-scan disappearance race: a browser temp file that vanished between directory scanning and `e.stat()` no longer aborts the whole scan and loses detection of other fresh partial files. Each entry's stat is now guarded individually.
