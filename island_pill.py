@@ -153,6 +153,18 @@ from island.scheduler import (  # noqa: E402
     NOTE_CLEAR_MS,
 )
 
+# Pure device decision tables (Stage 7): battery announcement ladder, BlueZ
+# property merges and summaries, NetworkManager transition machine. The host
+# keeps every Gio cached-property read, all scheduling and every side effect
+# (show_peek / start_charge_flash / queue_draw / wifi_watch_ap /
+# wifi_find_device); values the original code left unassigned (notably
+# wifi_state without a device proxy) are carried back through explicit
+# return values.
+from island.device_state import (  # noqa: E402
+    battery_announcement, bt_apply, bt_summary, wifi_eval, wifi_level,
+    wifi_summary,
+)
+
 
 def clock_text():
     return _clock_text(HOUR24)
@@ -728,20 +740,14 @@ class Island(Gtk.Window):
         if abs(self.batt_draw_pct - self.batt_target_pct) > 0.1 or (self.open and state in (1, 5)):
             self.ensure_visual_tick()
         if announce and old_state is not None:
-            plugged = state in (1, 4, 5)
-            was_plugged = old_state in (1, 4, 5)
-            if state == 4 and old_state != 4:
-                self.show_peek("battery", "Fully charged", "%d%%" % pct, accent=GREEN)
-            elif plugged and not was_plugged:
-                self.start_charge_flash()
-            elif was_plugged and not plugged:
-                self.show_peek("battery", "On battery", "%d%% remaining" % pct)
-            elif state in (2, 6) and old_pct is not None:
-                for t in LOW_BATTERY:
-                    if old_pct > t >= pct:
-                        self.show_peek("battery", "Battery low", "%d%% remaining" % pct,
-                                       secs=6, accent=ORANGE)
-                        break
+            decision = battery_announcement(old_pct, old_state, pct, state,
+                                            LOW_BATTERY)
+            if decision is not None:
+                if decision[0] == "flash":
+                    self.start_charge_flash()
+                else:
+                    _, title, body, secs, accent = decision
+                    self.show_peek("battery", title, body, secs=secs, accent=accent)
         if self.open:
             self.queue_draw()
 
@@ -799,50 +805,18 @@ class Island(Gtk.Window):
         self.queue_draw()
 
     def bt_apply(self, path, iface, props, announce):
-        if iface == "org.bluez.Adapter1":
-            if "Powered" in props:
-                self.bt_adapter = self.bt_adapter or path
-                if path == self.bt_adapter:
-                    self.bt_powered = bool(props["Powered"])
-        elif iface == "org.bluez.Device1":
-            d = self.bt_dev.setdefault(path, {"name": "", "connected": False, "battery": None})
-            name = props.get("Alias") or props.get("Name")
-            if name:
-                d["name"] = name
-            if "Connected" in props:
-                now = bool(props["Connected"])
-                changed = now != d["connected"]
-                d["connected"] = now
-                if announce and changed:
-                    body = "Disconnected"
-                    if now:
-                        body = "Connected" + (" · %d%%" % d["battery"]
-                                              if d["battery"] is not None else "")
-                    self.show_peek("bt", d["name"] or "Bluetooth device", body,
-                                   accent=BLUE if now else None)
-        elif iface == "org.bluez.Battery1":
-            d = self.bt_dev.setdefault(path, {"name": "", "connected": False, "battery": None})
-            if "Percentage" in props:
-                d["battery"] = int(props["Percentage"])
+        self.bt_adapter, self.bt_powered, announcement = bt_apply(
+            self.bt_adapter, self.bt_powered, self.bt_dev, path, iface,
+            props, announce)
+        if announcement:
+            title, body, accent = announcement
+            self.show_peek("bt", title, body, accent=accent)
         if self.open:
             self.queue_draw()
 
     def bt_summary(self):
         """Text and colour for the Bluetooth button in the open card."""
-        if self.bt_note:
-            return self.bt_note, ORANGE
-        if not self.bt_powered:
-            return "Off", DIM
-        connected = [d for d in self.bt_dev.values() if d["connected"]]
-        if not connected:
-            return "On", BLUE
-        if len(connected) > 1:
-            return "%d devices" % len(connected), WHITE
-        d = connected[0]
-        label = d["name"] or "Device"
-        if d["battery"] is not None:
-            label += " %d%%" % d["battery"]
-        return label, WHITE
+        return bt_summary(self.bt_note, self.bt_powered, self.bt_dev)
 
     def bt_toggle(self):
         if not self.bt_adapter or self.sysbus is None:
@@ -992,57 +966,49 @@ class Island(Gtk.Window):
         self.wifi_on = bool(v.unpack()) if v is not None else None
         v = self.nm.get_cached_property("WirelessHardwareEnabled")
         self.wifi_hw = bool(v.unpack()) if v is not None else True
-        if self.wdev is not None:       # adapter unplugged?
-            v = self.nm.get_cached_property("Devices")
-            if v is not None and self.wdev.get_object_path() not in v.unpack():
-                self.wdev = self.wdev_wl = self.wap = None
-                self.wap_path = ""
-                self.wifi_ssid, self.wifi_strength = "", 0
-        if self.wdev is None:
-            self.wifi_find_device()
-        up = False
-        if self.wdev is not None:
+        wdev_path = self.wdev.get_object_path() if self.wdev is not None else None
+        v = self.nm.get_cached_property("Devices")
+        device_paths = list(v.unpack()) if v is not None else None
+        if wdev_path is not None:
             v = self.wdev.get_cached_property("State")
-            self.wifi_state = int(v.unpack()) if v is not None else 0
+            device_state = int(v.unpack()) if v is not None else 0
             v = self.wdev_wl.get_cached_property("ActiveAccessPoint")
-            path = v.unpack() if v is not None else "/"
-            if path != self.wap_path:
-                self.wifi_watch_ap(path)
-            up = self.wifi_state == 100 and bool(self.wifi_ssid)
-        was, self.wifi_up = self.wifi_up, up
-        if up:
+            ap_path = v.unpack() if v is not None else "/"
+        else:
+            device_state, ap_path = 0, "/"     # placeholders — unused without a device
+        d = wifi_eval(
+            (self.wifi_up, self.wifi_seen, self.wifi_sig, self.wap_path,
+             self.wifi_state),
+            (self.wifi_on, self.wifi_hw, wdev_path, device_paths, device_state,
+             ap_path, self.wifi_ssid), announce)
+        if d["reset"]:
+            self.wdev = self.wdev_wl = self.wap = None
+            self.wap_path = ""
+            self.wifi_ssid, self.wifi_strength = "", 0
+        if d["summon"]:
+            self.wifi_find_device()
+        if self.wdev is not None:       # same branch the original reads/writes in
+            self.wifi_state = d["state"]
+        if d["watch"] is not None:
+            self.wifi_watch_ap(d["watch"])
+        self.wifi_up = d["up"]
+        if d["up"]:
             self.wifi_seen = self.wifi_ssid
-        if announce and up != was:
-            if up:
-                self.show_peek("wifi", self.wifi_ssid, "Wi-Fi connected", accent=BLUE)
-            elif self.wifi_on is False or self.wifi_state == 20:   # 20: radio switched off
-                self.show_peek("wifi", "Wi-Fi off")
-            else:
-                self.show_peek("wifi", "Wi-Fi disconnected", self.wifi_seen)
-        sig = (self.wifi_on, self.wifi_hw, self.wifi_up, self.wifi_ssid, self.wifi_state,
-               self.wdev is not None)
-        if sig != self.wifi_sig:        # NetworkManager changes properties often; redraw only on news
-            self.wifi_sig = sig
+        if d["announcement"]:
+            title, body, accent = d["announcement"]
+            self.show_peek("wifi", title, body, accent=accent)
+        if d["sig_changed"]:        # NetworkManager changes properties often; redraw only on news
+            self.wifi_sig = d["sig"]
             self.retarget()
             self.queue_draw()
 
     def wifi_level(self):
-        if not self.wifi_up:
-            return 0
-        s = self.wifi_strength
-        return 3 if s >= 67 else (2 if s >= 34 else 1)
+        return wifi_level(self.wifi_up, self.wifi_strength)
 
     def wifi_summary(self):
         """Text and colour for the Wi-Fi button in the open card."""
-        if self.wifi_note:
-            return self.wifi_note, ORANGE
-        if not self.wifi_on:
-            return "Off", DIM
-        if self.wifi_up:
-            return self.wifi_ssid, WHITE
-        if 40 <= self.wifi_state < 100:
-            return "Connecting", DIM
-        return "Not connected", DIM
+        return wifi_summary(self.wifi_note, self.wifi_on, self.wifi_up,
+                            self.wifi_state, self.wifi_ssid)
 
     def wifi_toggle(self):
         if self.nm is None or self.wifi_on is None:
