@@ -6,7 +6,7 @@ import cairo
 import island.rendering as R
 import island_pill
 from island.settings import FONT as SETTINGS_FONT
-from island.theme import WHITE as INK
+from island.theme import BLUE, GREEN, WHITE as INK
 
 SRC = Path(R.__file__).read_text(encoding="utf-8")
 
@@ -170,6 +170,50 @@ def test_reexport_identity():
     for name in NAMES:
         assert getattr(island_pill, name) is getattr(R, name), name
     assert SETTINGS_FONT is R.FONT is island_pill.FONT
+
+
+def test_card_constant():
+    assert R.CARD == (1.0, 1.0, 1.0, 0.08)
+
+
+def test_card_deterministic_and_visible():
+    def run():
+        cr, s = fresh(100, 60)
+        R.card(cr, 5, 5, 90, 50, 14)
+        return pixels(s)
+    assert run() == run()
+    assert run() != pixels(fresh(100, 60)[1])
+
+
+def test_tab_pill_deterministic_and_active_differs():
+    def run(active):
+        cr, s = fresh(200, 40)
+        R.tab_pill(cr, 10, 10, 180, 28, "Home", active, size=9)
+        return pixels(s)
+    assert run(True) == run(True)
+    assert run(False) == run(False)
+    assert run(True) != run(False)
+
+
+def test_state_dot_deterministic_and_color_differs():
+    def run(color):
+        cr, s = fresh(40, 40)
+        R.state_dot(cr, 20, 20, 8, color)
+        return pixels(s)
+    assert run(BLUE) == run(BLUE)
+    assert run(GREEN) == run(GREEN)
+    assert run(BLUE) != run(GREEN)
+
+
+def test_code_box_deterministic_and_differs_from_draw_text():
+    def run_code():
+        cr, s = fresh(120, 32)
+        R.code_box(cr, 5, 4, 110, 24, "ls -la", size=9)
+        return pixels(s)
+    assert run_code() == run_code()
+    cr, s = fresh(120, 32)
+    R.draw_text(cr, "ls -la", 5, 20, 9, INK)
+    assert run_code() != pixels(s)
 
 
 def test_scratch_and_dl_seg_ownership():
