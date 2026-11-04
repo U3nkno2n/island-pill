@@ -77,7 +77,7 @@ OPEN_H_BASE = 148                # media / clock, stats and timer rows
 TAB_ROW_H = 36                   # tab row at the top of the open card
 ROW_CONN_H = 34                  # Wi-Fi + Bluetooth row (only if either exists)
 ROW_DL_H = 40                    # download row (only while downloading)
-OPEN_H_MAX = OPEN_H_BASE + ROW_CONN_H + ROW_DL_H
+OPEN_H_MAX = OPEN_H_BASE + TAB_ROW_H + ROW_CONN_H + ROW_DL_H
 WIN_W = OPEN_W + 60
 WIN_H = TOP_MARGIN + OPEN_H_MAX + 8
 NET_POLL_SECONDS = 0.5           # faster samples make speed and activity detection more responsive
@@ -1315,7 +1315,7 @@ class Island(Gtk.Window):
         layers = [((self.idle_w(False), self.idle_w(True)), (IDLE_H, IDLE_H + DL_EXTRA),
                    self.draw_idle),
                   ((PEEK_W, PEEK_W), (PEEK_H, PEEK_H), self.draw_peek),
-                  ((OPEN_W, OPEN_W), (OPEN_H_BASE, OPEN_H_MAX), self.draw_open)]
+                  ((OPEN_W, OPEN_W), (OPEN_H_BASE + TAB_ROW_H, OPEN_H_MAX), self.draw_open)]
         for (wlo, whi), (hlo, hhi), fn in layers:
             dist = 0.0
             for cur, lo, hi in ((self.w, wlo, whi), (self.h, hlo, hhi)):
