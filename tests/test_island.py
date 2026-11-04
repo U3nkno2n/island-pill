@@ -672,5 +672,24 @@ class TestOpenTabsHeadless(unittest.TestCase):
         self._draw()
 
 
+class TestOpenHeightMax(unittest.TestCase):
+    """open_h() with everything showing must equal OPEN_H_MAX, and the
+    window must be tall enough to hold it."""
+
+    def setUp(self):
+        self.win = island_pill.Island.__new__(island_pill.Island)
+        self.win.dl_active = True
+        self.win.has_conn = lambda: True
+
+    def test_open_h_equals_open_h_max_when_full(self):
+        self.assertEqual(self.win.open_h(), island_pill.OPEN_H_MAX)
+
+    def test_win_h_fits_open_h_max(self):
+        self.assertGreaterEqual(
+            island_pill.WIN_H,
+            island_pill.TOP_MARGIN + island_pill.OPEN_H_MAX,
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
