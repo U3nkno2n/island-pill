@@ -29,7 +29,7 @@ class TestSettingsReexport:
         assert island.settings.FONT == "Sans"
         assert island.settings.TIMER_PRESETS == (5, 10, 25)
         assert island.settings.PEEK_SECONDS == 4
-        assert island.settings.HOVER_OPEN_DELAY_MS == 5000
+        assert island.settings.HOVER_OPEN_DELAY_MS == 300
         assert island.settings.LOW_BATTERY == (20, 10)
         assert island.settings.DOWNLOAD_MIN_KBPS == 1200
         assert island.settings.SHOW_DOWNLOADS is True
@@ -39,7 +39,7 @@ class TestSettingsReexport:
         assert island.settings.HOVER_ONLY is True
         assert island.settings.HOVER_ONLY_PEEKS is True
         assert island.settings.SHOW_NOTIFICATIONS is True
-        assert island.settings.STYLE == "pill"  # env unset in test env
+        assert island.settings.STYLE == "notch"  # env unset in test env
 
     def test_reexport_identity_with_island_pill(self):
         # The host binds the SAME objects (one import, no copied constants).

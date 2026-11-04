@@ -9,6 +9,8 @@ import tempfile
 import time
 import unittest
 
+import cairo  # noqa: E402
+
 # Set headless env before importing the module (no GTK display needed for
 # the functions we test here).
 os.environ.setdefault("DISPLAY", "")
@@ -621,6 +623,53 @@ class TestOpenCodePermissionHandling(unittest.TestCase):
         # Should not raise
         self.win.opencode_decision("perm-3", "allow")
         self.assertNotIn("perm-3", self.win.pending_permissions)
+
+
+class TestOpenTabsHeadless(unittest.TestCase):
+    """Headless draw_open for each tab value on a cairo ImageSurface."""
+
+    def setUp(self):
+        self.win = island_pill.Island.__new__(island_pill.Island)
+        self.win.open_tab = "Home"
+        self.win.hits = []
+        self.win.current_player = lambda: None
+        self.win.cpu_pct = None
+        self.win.mem_used = None
+        self.win.mem_total = None
+        self.win.temp_cached = None
+        self.win.batt_pct = None
+        self.win.batt_state = None
+        self.win.batt_draw_pct = None
+        self.win.charge_phase = 0.0
+        self.win.timer_end = None
+        self.win.dl_active = False
+        self.win.dl_phase = 0.0
+        self.win.has_conn = lambda: False
+        self.win.retarget = lambda: None
+        self.win.queue_draw = lambda: None
+        self.win.get_mapped = lambda: False
+        self.win.add_timer = lambda m: None
+        self.win.start_timer = lambda m: None
+        self.win.cancel_timer = lambda: None
+        self.win.mpris_call = lambda method: None
+
+    def _draw(self):
+        surf = cairo.ImageSurface(cairo.FORMAT_ARGB32,
+                                  island_pill.WIN_W, island_pill.WIN_H)
+        cr = cairo.Context(surf)
+        self.win.draw_open(cr)
+
+    def test_draw_open_home(self):
+        self.win.open_tab = "Home"
+        self._draw()
+
+    def test_draw_open_opencode(self):
+        self.win.open_tab = "OpenCode"
+        self._draw()
+
+    def test_draw_open_system(self):
+        self.win.open_tab = "System"
+        self._draw()
 
 
 if __name__ == "__main__":

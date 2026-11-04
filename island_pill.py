@@ -74,6 +74,7 @@ DL_EXTRA = 6                     # extra idle height while the download bar is s
 PEEK_W, PEEK_H = 360, 58
 OPEN_W = 400
 OPEN_H_BASE = 148                # media / clock, stats and timer rows
+TAB_ROW_H = 36                   # tab row at the top of the open card
 ROW_CONN_H = 34                  # Wi-Fi + Bluetooth row (only if either exists)
 ROW_DL_H = 40                    # download row (only while downloading)
 OPEN_H_MAX = OPEN_H_BASE + ROW_CONN_H + ROW_DL_H
@@ -106,7 +107,7 @@ from island.rendering import (  # noqa: E402
     rounded_rect, shape_path, _layout, measure, draw_text, glyph_tri,
     glyph_skip, glyph_pause, draw_bars, draw_battery, draw_clock_icon,
     draw_bt_glyph, draw_wifi_glyph, draw_down_arrow, progress_bar,
-    indeterminate_bar,
+    indeterminate_bar, tab_pill,
 )
 
 
@@ -213,6 +214,7 @@ class Island(Gtk.Window):
         self.peek = {}
         self.peek_on = False
         self.hits = []
+        self.open_tab = "Home"
         self.timer_end = None
         self.timer_mins = 0
         self._media = MediaPlayer(self)   # MPRIS tracker; host = self
@@ -405,7 +407,7 @@ class Island(Gtk.Window):
         return self.wdev is not None or self.bt_powered is not None
 
     def open_h(self):
-        return (OPEN_H_BASE + (ROW_CONN_H if self.has_conn() else 0)
+        return (OPEN_H_BASE + TAB_ROW_H + (ROW_CONN_H if self.has_conn() else 0)
                 + (ROW_DL_H if self.dl_active else 0))
 
     def target(self):
@@ -1482,6 +1484,20 @@ class Island(Gtk.Window):
         left, right = ox + 22, ox + OPEN_W - 22
         cur = self.current_player()
 
+        # Tab row: Home, OpenCode, System
+        ty = oy + 8
+        th = 28
+        gap = 8
+        tw = (OPEN_W - 44 - 2 * gap) / 3.0
+        tx = left
+        for label in ("Home", "OpenCode", "System"):
+            active = self.open_tab == label
+            tab_pill(cr, tx, ty, tw, th, label, active)
+            self.hits.append((tx, ty, tw, th,
+                              lambda l=label: self.set_tab(l)))
+            tx += tw + gap
+        oy += TAB_ROW_H
+
         # row A: media, or big clock + date
         if cur:
             p = cur[1]
@@ -1565,6 +1581,10 @@ class Island(Gtk.Window):
         # row E: download, only while one is running
         if self.dl_active:
             self.draw_download(cr, left, right, cy)
+
+    def set_tab(self, name):
+        self.open_tab = name
+        self.queue_draw()
 
     def draw_download(self, cr, left, right, last):
         """File name, speed and bar. `last` is the vertical centre of the row above."""

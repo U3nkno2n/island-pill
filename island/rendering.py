@@ -215,3 +215,49 @@ def indeterminate_bar(cr, x, y, w, h, phase, color):
     rounded_rect(cr, sx, y, seg, h, h / 2.0)
     cr.fill()
     cr.restore()
+
+
+# Dark-grey card fill: about 8% white on the black panel.
+CARD = (1.0, 1.0, 1.0, 0.08)
+
+
+def card(cr, x, y, w, h, r=14, color=CARD):
+    """Fill a rounded dark-grey card (default radius 14 px)."""
+    cr.set_source_rgba(*color)
+    rounded_rect(cr, x, y, w, h, r)
+    cr.fill()
+
+
+def tab_pill(cr, x, y, w, h, label, active, size=9):
+    """A tab pill: active = white fill + dark text; inactive = dim text.
+    Caller keeps h >= 28 px and size >= 9 pt."""
+    if active:
+        cr.set_source_rgba(1, 1, 1, 1)
+        rounded_rect(cr, x, y, w, h, h / 2.0)
+        cr.fill()
+        fg = (0, 0, 0, 1)
+    else:
+        fg = (1, 1, 1, 0.55)
+    draw_text(cr, label, x + w / 2.0, y + h / 2.0, size, fg, bold=True, align=1)
+
+
+def state_dot(cr, cx, cy, r, color):
+    """Filled circle for a session state dot (working BLUE / done GREEN / failed ORANGE)."""
+    cr.set_source_rgba(*color)
+    cr.arc(cx, cy, r, 0, 2 * math.pi)
+    cr.fill()
+
+
+def code_box(cr, x, y, w, h, text, size=9):
+    """A rounded card containing monospace text (a command), >= 9 pt."""
+    cr.set_source_rgba(*CARD)
+    rounded_rect(cr, x, y, w, h, h / 2.0)
+    cr.fill()
+    lay = PangoCairo.create_layout(cr)
+    lay.set_font_description(Pango.FontDescription("monospace %d" % size))
+    lay.set_single_paragraph_mode(True)
+    lay.set_text(text, -1)
+    tw, th = lay.get_pixel_size()
+    cr.move_to(x + (w - tw) / 2.0, y + (h - th) / 2.0)
+    cr.set_source_rgba(1, 1, 1, 1)
+    PangoCairo.show_layout(cr, lay)
