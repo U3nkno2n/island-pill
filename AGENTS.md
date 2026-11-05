@@ -5,3 +5,4 @@
 - Never edit `island_pill.py.opencode-bridge-backup`, `install-opencode.sh` or `island-pill-notify.js` unless I ask.
 - To see a change on screen, run `bash install.sh`.
 - Coucou is only a visual inspiration. Do not copy its code, artwork or sounds.
+- After changing island-pill-notify.js also run: node --check island-pill-notify.js && node --test
