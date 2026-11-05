@@ -33,6 +33,7 @@ import os
 import signal
 import sys
 import time
+import traceback
 
 # Keep GTK from loading things this widget never uses: the accessibility bridge, GTK modules,
 # and GDK's OpenGL setup (it pulls in Mesa and LLVM, roughly 50 MB, and we only draw with cairo).
@@ -83,7 +84,9 @@ HOME_PAD_B = 12                  # bottom padding after Home's last card
 OPEN_H_BASE = TAB_ROW_H + MUSIC_CARD_H + HOME_PAD_B   # Home base, incl. tab row
 ROW_CONN_H = HOME_GAP + TILE_H   # tiles row growth on Home (only if either exists)
 ROW_DL_H = HOME_GAP + DL_CARD_H  # download row growth on Home (only while downloading)
-SYSTEM_CONTENT_H = 84            # stats + timer rows below the tab row
+STATS_CARD_H = 44                # stats card on System (CPU / RAM / TEMP / battery)
+TIMER_CARD_H = 44                # timer card on System (timer chips or countdown)
+SYSTEM_CONTENT_H = STATS_CARD_H + HOME_GAP + TIMER_CARD_H + HOME_PAD_B   # cards + gap + padding
 OPENCODE_CONTENT_H = 84          # "No sessions yet" card below the tab row
 OPEN_H_MAX = OPEN_H_BASE + ROW_CONN_H + ROW_DL_H
 OPEN_MIN_H = min(OPEN_H_BASE,
@@ -192,6 +195,15 @@ def clock_text():
     return _clock_text(HOUR24)
 
 
+def window_origin(gw):
+    """Widget origin as (x, y), whether get_origin() returns (x, y) or the
+    3-tuple (ok, x, y) this platform's PyGObject exposes."""
+    origin = gw.get_origin()
+    if len(origin) == 3:
+        return origin[1], origin[2]
+    return origin
+
+
 # ------------------------------------------------------------------ island ----
 class Island(Gtk.Window):
     def __init__(self):
@@ -226,6 +238,7 @@ class Island(Gtk.Window):
         self.peek_on = False
         self.hits = []
         self.open_tab = "Home"
+        self._sec_warned = False
         self.timer_end = None
         self.timer_mins = 0
         self._media = MediaPlayer(self)   # MPRIS tracker; host = self
@@ -610,11 +623,16 @@ class Island(Gtk.Window):
         if self.timer_end is not None and self.timer_left() <= 0:
             self.timer_done()
         if self.open:
-            self.sample_stats()
-            self.check_pointer()
-            tw, th = self.target()   # a row may have appeared (Bluetooth / Wi-Fi found)
-            if abs(tw - self.w) > 0.3 or abs(th - self.h) > 0.3:
-                self.retarget()
+            try:
+                self.sample_stats()
+                self.check_pointer()
+                tw, th = self.target()   # a row may have appeared (Bluetooth / Wi-Fi found)
+                if abs(tw - self.w) > 0.3 or abs(th - self.h) > 0.3:
+                    self.retarget()
+            except Exception:
+                if not self._sec_warned:
+                    self._sec_warned = True
+                    traceback.print_exc()
         self.queue_draw()
         return GLib.SOURCE_CONTINUE
 
@@ -646,7 +664,7 @@ class Island(Gtk.Window):
         if gw is None or seat is None or self._ids["close"]:
             return
         _, px, py = seat.get_pointer().get_position()
-        wx, wy = gw.get_origin()
+        wx, wy = window_origin(gw)
         x, y, w, h = self.pill_rect()
         if not (wx + x - 10 <= px <= wx + x + w + 10 and py <= wy + y + h + 10):
             self._ids["close"] = once(CLOSE_HYSTERESIS_MS, self._do_close)
@@ -1465,7 +1483,7 @@ class Island(Gtk.Window):
         self.hits.append((x, y, w, h, fn))
 
     def chip(self, cr, x, cy, w, label, fn, fg=WHITE, bg=FAINT):
-        h = 26
+        h = 28
         cr.set_source_rgba(*bg)
         rounded_rect(cr, x, cy - h / 2.0, w, h, h / 2.0)
         cr.fill()
@@ -1586,19 +1604,21 @@ class Island(Gtk.Window):
                   oy + 12 + ch / 2.0, 11, DIM, align=1)
 
     def _draw_system(self, cr, oy, left, right, cur):
-        # row B: stats
-        cy = oy + 24
-        colw = (right - left) / 4.0
+        # stats card: CPU, RAM, TEMP and battery cells in one row
+        w = right - left
+        card(cr, left, oy, w, STATS_CARD_H)
+        cy = oy + STATS_CARD_H / 2.0
+        colw = (w - 2 * HOME_CARD_PAD) / 4.0
         cells = [
             ("CPU", "--" if self.cpu_pct is None else "%d%%" % self.cpu_pct),
             ("RAM", "--" if self.mem_used is None else "%.1fG" % self.mem_used),
             ("TEMP", "--" if self.temp_cached is None else "%d°" % round(self.temp_cached)),
         ]
         for i, (label, value) in enumerate(cells):
-            cx = left + i * colw
-            lw = draw_text(cr, label, cx, cy, 8, DIM)
+            cx = left + HOME_CARD_PAD + i * colw
+            lw = draw_text(cr, label, cx, cy, 9, DIM)
             draw_text(cr, value, cx + lw + 5, cy, 10, WHITE, bold=True)
-        bx = left + 3 * colw
+        bx = left + HOME_CARD_PAD + 3 * colw
         if self.batt_pct is None:
             draw_text(cr, "AC", bx, cy, 10, DIM, bold=True)
         else:
@@ -1609,20 +1629,23 @@ class Island(Gtk.Window):
             draw_battery(cr, bx, cy, shown_pct, charging, col, pulse)
             draw_text(cr, "%d%%" % self.batt_pct, bx + 29, cy, 10, WHITE, bold=True)
 
-        # row C: timer
-        cy = oy + 59
+        # timer card: presets while idle, countdown + chips while running
+        ty = oy + STATS_CARD_H + HOME_GAP
+        card(cr, left, ty, w, TIMER_CARD_H)
+        cy = ty + TIMER_CARD_H / 2.0
         if self.timer_end is not None:
-            draw_text(cr, fmt_mmss(max(0, self.timer_left())), left, cy, 12, ORANGE, bold=True)
-            self.chip(cr, left + 74, cy, 46, "+5m", lambda: self.add_timer(5))
-            self.chip(cr, left + 128, cy, 64, "Cancel", self.cancel_timer, fg=ORANGE)
+            draw_text(cr, fmt_mmss(max(0, self.timer_left())), left + HOME_CARD_PAD, cy, 12,
+                      ORANGE, bold=True)
+            self.chip(cr, left + 86, cy, 46, "+5m", lambda: self.add_timer(5))
+            self.chip(cr, left + 140, cy, 64, "Cancel", self.cancel_timer, fg=ORANGE)
         else:
-            draw_text(cr, "Timer", left, cy, 9, DIM)
-            x = left + 52
+            draw_text(cr, "Timer", left + HOME_CARD_PAD, cy, 9, DIM)
+            x = left + 64
             for m in TIMER_PRESETS:
                 self.chip(cr, x, cy, 48, "%dm" % m, lambda m=m: self.start_timer(m))
                 x += 56
         if cur and not self.has_conn():
-            draw_text(cr, clock_text(), right, cy, 10, DIM, align=2)
+            draw_text(cr, clock_text(), right - HOME_CARD_PAD, cy, 10, DIM, align=2)
 
     def draw_download(self, cr, left, right, last):
         """Download card: file name, speed and bar. `last` is the card's top y."""
