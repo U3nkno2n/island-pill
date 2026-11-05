@@ -753,6 +753,49 @@ class TestOpenTilesHeadless(unittest.TestCase):
                 self._draw()
 
 
+class TestOpenSystemStatesHeadless(unittest.TestCase):
+    """Headless System tab draws for the three timer states: no timer,
+    a timer running and a timer finished (elapsed clamps to 0:00)."""
+
+    def setUp(self):
+        self.win = island_pill.Island.__new__(island_pill.Island)
+        self.win.open_tab = "System"
+        self.win.hits = []
+        self.win.current_player = lambda: None
+        self.win.cpu_pct = None
+        self.win.mem_used = None
+        self.win.mem_total = None
+        self.win.temp_cached = None
+        self.win.batt_pct = None
+        self.win.batt_state = None
+        self.win.batt_draw_pct = None
+        self.win.charge_phase = 0.0
+        self.win.has_conn = lambda: False
+        self.win.retarget = lambda: None
+        self.win.queue_draw = lambda: None
+        self.win.get_mapped = lambda: False
+        self.win.dl_active = False
+        self.win.dl_phase = 0.0
+
+    def _draw(self):
+        surf = cairo.ImageSurface(cairo.FORMAT_ARGB32,
+                                  island_pill.WIN_W, island_pill.WIN_H)
+        cr = cairo.Context(surf)
+        self.win.draw_open(cr)
+
+    def test_system_no_timer(self):
+        self.win.timer_end = None
+        self._draw()
+
+    def test_system_timer_running(self):
+        self.win.timer_end = time.monotonic() + 300.0
+        self._draw()
+
+    def test_system_timer_done(self):
+        self.win.timer_end = time.monotonic() - 60.0
+        self._draw()
+
+
 class TestOpenHeightMax(unittest.TestCase):
     """Every tab's height must fit inside OPEN_H_MAX; Home with the
     Wi-Fi/Bluetooth and download rows showing must be exactly OPEN_H_MAX;
