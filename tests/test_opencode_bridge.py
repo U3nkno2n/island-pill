@@ -18,6 +18,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 os.environ.setdefault("DISPLAY", "")
 
 from gi.repository import GLib  # noqa: E402
+import island_pill_opencode_bridge  # noqa: E402
 from island_pill_opencode_bridge import OpenCodeBridge  # noqa: E402
 
 
@@ -144,6 +145,74 @@ class TestOpenCodeBridge(unittest.TestCase):
         })
         self.assertEqual(len(self.win.peek_calls), 1)
         self.assertEqual(self.win.peek_calls[0][0], "opencode-error")
+
+    # ------------------------------------------------- working safety net --
+
+    def _handle_with_ttl_0(self, client, msg_dict):
+        """Handle a message with DEDUP_TTL = 0 so only the per-session rule
+        decides (the generic time-based dedup is neutralised)."""
+        old = island_pill_opencode_bridge.DEDUP_TTL
+        island_pill_opencode_bridge.DEDUP_TTL = 0.0
+        try:
+            self._handle(client, msg_dict)
+        finally:
+            island_pill_opencode_bridge.DEDUP_TTL = old
+
+    def test_working_once_per_session(self):
+        client = FakeClient()
+        self._handle_with_ttl_0(client, {
+            "type": "working", "session": "s1", "ts": 1000.0,
+        })
+        self._handle_with_ttl_0(client, {
+            "type": "working", "session": "s1", "ts": 1000.1,
+        })
+        self.assertEqual(len(self.win.peek_calls), 1)
+
+    def test_working_after_done_peeks_again(self):
+        client = FakeClient()
+        self._handle_with_ttl_0(client, {
+            "type": "working", "session": "s1", "ts": 1000.0,
+        })
+        self._handle(client, {
+            "type": "done", "session": "s1", "ts": 1001.0,
+        })
+        self._handle_with_ttl_0(client, {
+            "type": "working", "session": "s1", "ts": 1002.0,
+        })
+        # working, done, then working again after the turn closed
+        self.assertEqual(len(self.win.peek_calls), 3)
+
+    def test_working_two_sessions_each_peek(self):
+        client = FakeClient()
+        self._handle(client, {
+            "type": "working", "session": "s1", "ts": 1000.0,
+        })
+        self._handle(client, {
+            "type": "working", "session": "s2", "ts": 1000.1,
+        })
+        self.assertEqual(len(self.win.peek_calls), 2)
+
+    def test_permission_and_done_as_before(self):
+        called = []
+        self.bridge.register_decision_callback(lambda info: called.append(info))
+        client = FakeClient()
+        self._handle(client, {
+            "type": "working", "session": "s1", "ts": 1000.0,
+        })
+        self._handle(client, {
+            "type": "permission", "session": "s1", "reqid": "p1",
+            "title": "Edit file.py", "ts": 1001.0,
+        })
+        # permission registers and notifies the host; it shows no peek itself
+        self.assertIn(("s1", "p1"), self.bridge.pending_permissions)
+        self.assertEqual(len(called), 1)
+        self.assertEqual(len(self.win.peek_calls), 1)
+        # done still completes the turn and peeks (working + done)
+        self._handle(client, {
+            "type": "done", "session": "s1", "ts": 1002.0,
+        })
+        self.assertEqual(len(self.win.peek_calls), 2)
+        self.assertEqual(self.win.peek_calls[1][0], "opencode")
 
     # ------------------------------------------------- control connection --
 
