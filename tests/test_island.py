@@ -43,20 +43,23 @@ class TestFormatters(unittest.TestCase):
 
 
 class TestCheckPointer(unittest.TestCase):
-    """Test that gw.get_origin() is unpacked correctly (regression for the
-    ValueError crash in check_pointer)."""
+    """window_origin() must return (x, y) for both get_origin() shapes:
+    the 2-tuple (x, y) and the 3-tuple (ok, x, y) some PyGObject builds
+    expose (regression for the ValueError crash in check_pointer)."""
 
-    def test_get_origin_unpacking(self):
-        # get_origin() returns a 2-tuple (x, y); [1:] would yield a 1-tuple
-        # that cannot be unpacked into wx, wy. Verify the fix.
-        origin = (100, 50)
-        wx, wy = origin  # this is what the fixed code does
-        self.assertEqual(wx, 100)
-        self.assertEqual(wy, 50)
+    @staticmethod
+    def fake_window(origin):
+        class FakeWin:
+            def get_origin(self):
+                return origin
+        return FakeWin()
 
-        # The buggy version would be: wx, wy = origin[1:] -> ValueError
-        with self.assertRaises(ValueError):
-            wx, wy = origin[1:]
+    def test_window_origin_2tuple(self):
+        self.assertEqual(island_pill.window_origin(self.fake_window((100, 50))), (100, 50))
+
+    def test_window_origin_3tuple(self):
+        self.assertEqual(island_pill.window_origin(self.fake_window((True, 100, 50))),
+                         (100, 50))
 
 
 class TestDownloadDetection(unittest.TestCase):
