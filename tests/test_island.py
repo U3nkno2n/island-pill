@@ -298,6 +298,7 @@ class TestTargetMatrix(unittest.TestCase):
         self.win.wdev = None
         self.win.bt_powered = None
         self.win.dl_active = False
+        self.win.open_tab = "Home"
 
     def case(self, hover_only, pointer_inside, activity_visible, is_open, peek_on):
         island_pill.HOVER_ONLY = hover_only
@@ -673,15 +674,22 @@ class TestOpenTabsHeadless(unittest.TestCase):
 
 
 class TestOpenHeightMax(unittest.TestCase):
-    """open_h() with everything showing must equal OPEN_H_MAX, and the
-    window must be tall enough to hold it."""
+    """Every tab's height must fit inside OPEN_H_MAX; Home with the
+    Wi-Fi/Bluetooth and download rows showing must be exactly OPEN_H_MAX;
+    and the window must be tall enough to hold it."""
 
     def setUp(self):
         self.win = island_pill.Island.__new__(island_pill.Island)
         self.win.dl_active = True
         self.win.has_conn = lambda: True
 
-    def test_open_h_equals_open_h_max_when_full(self):
+    def test_open_h_within_open_h_max_for_every_tab(self):
+        for tab in ("Home", "OpenCode", "System"):
+            self.win.open_tab = tab
+            self.assertLessEqual(self.win.open_h(), island_pill.OPEN_H_MAX)
+
+    def test_open_h_home_full_equals_open_h_max(self):
+        self.win.open_tab = "Home"
         self.assertEqual(self.win.open_h(), island_pill.OPEN_H_MAX)
 
     def test_win_h_fits_open_h_max(self):

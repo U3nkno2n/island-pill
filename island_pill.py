@@ -73,11 +73,16 @@ IDLE_H = 30 if NOTCH else 34
 DL_EXTRA = 6                     # extra idle height while the download bar is showing (px)
 PEEK_W, PEEK_H = 360, 58
 OPEN_W = 400
-OPEN_H_BASE = 148                # media / clock, stats and timer rows
+OPEN_H_BASE = 148                # media / clock row + divider (Home base)
 TAB_ROW_H = 36                   # tab row at the top of the open card
 ROW_CONN_H = 34                  # Wi-Fi + Bluetooth row (only if either exists)
 ROW_DL_H = 40                    # download row (only while downloading)
+SYSTEM_CONTENT_H = 84            # stats + timer rows below the tab row
+OPENCODE_CONTENT_H = 84          # "No sessions yet" card below the tab row
 OPEN_H_MAX = OPEN_H_BASE + TAB_ROW_H + ROW_CONN_H + ROW_DL_H
+OPEN_MIN_H = min(OPEN_H_BASE + TAB_ROW_H,
+                 TAB_ROW_H + SYSTEM_CONTENT_H,
+                 TAB_ROW_H + OPENCODE_CONTENT_H)
 WIN_W = OPEN_W + 60
 WIN_H = TOP_MARGIN + OPEN_H_MAX + 8
 NET_POLL_SECONDS = 0.5           # faster samples make speed and activity detection more responsive
@@ -107,7 +112,7 @@ from island.rendering import (  # noqa: E402
     rounded_rect, shape_path, _layout, measure, draw_text, glyph_tri,
     glyph_skip, glyph_pause, draw_bars, draw_battery, draw_clock_icon,
     draw_bt_glyph, draw_wifi_glyph, draw_down_arrow, progress_bar,
-    indeterminate_bar, tab_pill,
+    indeterminate_bar, tab_pill, card,
 )
 
 
@@ -407,8 +412,12 @@ class Island(Gtk.Window):
         return self.wdev is not None or self.bt_powered is not None
 
     def open_h(self):
-        return (OPEN_H_BASE + TAB_ROW_H + (ROW_CONN_H if self.has_conn() else 0)
-                + (ROW_DL_H if self.dl_active else 0))
+        if self.open_tab == "Home":
+            return (OPEN_H_BASE + TAB_ROW_H + (ROW_CONN_H if self.has_conn() else 0)
+                    + (ROW_DL_H if self.dl_active else 0))
+        if self.open_tab == "System":
+            return TAB_ROW_H + SYSTEM_CONTENT_H
+        return TAB_ROW_H + OPENCODE_CONTENT_H
 
     def target(self):
         # Guard order and the activity short-circuit live in
@@ -1315,7 +1324,7 @@ class Island(Gtk.Window):
         layers = [((self.idle_w(False), self.idle_w(True)), (IDLE_H, IDLE_H + DL_EXTRA),
                    self.draw_idle),
                   ((PEEK_W, PEEK_W), (PEEK_H, PEEK_H), self.draw_peek),
-                  ((OPEN_W, OPEN_W), (OPEN_H_BASE + TAB_ROW_H, OPEN_H_MAX), self.draw_open)]
+                  ((OPEN_W, OPEN_W), (OPEN_MIN_H, OPEN_H_MAX), self.draw_open)]
         for (wlo, whi), (hlo, hhi), fn in layers:
             dist = 0.0
             for cur, lo, hi in ((self.w, wlo, whi), (self.h, hlo, hhi)):
@@ -1498,6 +1507,19 @@ class Island(Gtk.Window):
             tx += tw + gap
         oy += TAB_ROW_H
 
+        if self.open_tab == "Home":
+            self._draw_home(cr, oy, left, right, cur)
+        elif self.open_tab == "OpenCode":
+            self._draw_opencode(cr, oy, left, right)
+        else:
+            self._draw_system(cr, oy, left, right, cur)
+
+    def set_tab(self, name):
+        self.open_tab = name
+        self.retarget()
+        self.queue_draw()
+
+    def _draw_home(self, cr, oy, left, right, cur):
         # row A: media, or big clock + date
         if cur:
             p = cur[1]
@@ -1522,8 +1544,43 @@ class Island(Gtk.Window):
         cr.rectangle(left, oy + 64, right - left, 1)
         cr.fill()
 
+        # row D: Wi-Fi and Bluetooth buttons (tap to switch on / off), in the
+        # same slot the timer row held below it on the old card
+        if self.has_conn():
+            cy = oy + 152
+            x = left
+            if self.wdev is not None:
+                label, color = self.wifi_summary()
+                on = bool(self.wifi_on) and not self.wifi_note
+                lvl = self.wifi_level()
+                x += self.conn_chip(
+                    cr, x, cy, label, color, on,
+                    lambda c, ix, iy, col: draw_wifi_glyph(c, ix, iy, col, lvl),
+                    self.wifi_toggle) + 8
+            if self.bt_powered is not None:
+                label, color = self.bt_summary()
+                on = bool(self.bt_powered) and not self.bt_note
+                self.conn_chip(cr, x, cy, label, color, on, draw_bt_glyph, self.bt_toggle)
+            last = cy
+        else:
+            # no chips row: anchor at the slot the timer row used to leave,
+            # so the download keeps its old position
+            last = oy + 118
+
+        # row E: download, only while one is running
+        if self.dl_active:
+            self.draw_download(cr, left, right, last)
+
+    def _draw_opencode(self, cr, oy, left, right):
+        # one card, centred text, until real session rows land here
+        ch = OPENCODE_CONTENT_H - 24
+        card(cr, left, oy + 12, right - left, ch)
+        draw_text(cr, "No sessions yet", left + (right - left) / 2.0,
+                  oy + 12 + ch / 2.0, 11, DIM, align=1)
+
+    def _draw_system(self, cr, oy, left, right, cur):
         # row B: stats
-        cy = oy + 83
+        cy = oy + 24
         colw = (right - left) / 4.0
         cells = [
             ("CPU", "--" if self.cpu_pct is None else "%d%%" % self.cpu_pct),
@@ -1546,7 +1603,7 @@ class Island(Gtk.Window):
             draw_text(cr, "%d%%" % self.batt_pct, bx + 29, cy, 10, WHITE, bold=True)
 
         # row C: timer
-        cy = oy + 118
+        cy = oy + 59
         if self.timer_end is not None:
             draw_text(cr, fmt_mmss(max(0, self.timer_left())), left, cy, 12, ORANGE, bold=True)
             self.chip(cr, left + 74, cy, 46, "+5m", lambda: self.add_timer(5))
@@ -1557,34 +1614,8 @@ class Island(Gtk.Window):
             for m in TIMER_PRESETS:
                 self.chip(cr, x, cy, 48, "%dm" % m, lambda m=m: self.start_timer(m))
                 x += 56
-        has_conn = self.has_conn()
-        if cur and not has_conn:
+        if cur and not self.has_conn():
             draw_text(cr, clock_text(), right, cy, 10, DIM, align=2)
-
-        # row D: Wi-Fi and Bluetooth buttons (tap to switch on / off)
-        if has_conn:
-            cy += ROW_CONN_H
-            x = left
-            if self.wdev is not None:
-                label, color = self.wifi_summary()
-                on = bool(self.wifi_on) and not self.wifi_note
-                lvl = self.wifi_level()
-                x += self.conn_chip(
-                    cr, x, cy, label, color, on,
-                    lambda c, ix, iy, col: draw_wifi_glyph(c, ix, iy, col, lvl),
-                    self.wifi_toggle) + 8
-            if self.bt_powered is not None:
-                label, color = self.bt_summary()
-                on = bool(self.bt_powered) and not self.bt_note
-                self.conn_chip(cr, x, cy, label, color, on, draw_bt_glyph, self.bt_toggle)
-
-        # row E: download, only while one is running
-        if self.dl_active:
-            self.draw_download(cr, left, right, cy)
-
-    def set_tab(self, name):
-        self.open_tab = name
-        self.queue_draw()
 
     def draw_download(self, cr, left, right, last):
         """File name, speed and bar. `last` is the vertical centre of the row above."""
