@@ -72,6 +72,14 @@ const sendControl = (payload) => {
 let controlSock = null;
 let controlBuffer = "";
 
+// Outbound message queue used while the control socket is down or
+// reconnecting.  Messages are flushed in order once connected.
+const sendQueue = [];
+const MAX_SEND_QUEUE = 50;
+// Logged once per outage so the debug log is not flooded with one line
+// per dropped message.
+let socketOfflineLogged = false;
+
 // Pending permission requests awaiting a decision from the island.
 // reqid -> { resolve, timer }
 const pendingPermissions = new Map();
@@ -85,9 +93,20 @@ function connectControl() {
   controlSock.unref();
   controlSock.on("connect", () => {
     debugLog("control-connect", { result: "connected" });
+    socketOfflineLogged = false;
     try {
       controlSock.write(JSON.stringify({ type: "control", agent: "opencode" }) + "\n");
     } catch {}
+    // Flush any queued messages in order once connected.
+    while (sendQueue.length) {
+      const next = sendQueue.shift();
+      try {
+        controlSock.write(next);
+      } catch {
+        controlSock = null;
+        break;
+      }
+    }
   });
   controlSock.on("data", (data) => {
     controlBuffer += data.toString();
@@ -130,13 +149,23 @@ function sendEvent(payload) {
     debugLog("socket-send", { result: "no-socket-path" });
     return;
   }
+  const line = JSON.stringify(payload) + "\n";
   if (!controlSock || controlSock.destroyed) {
-    debugLog("socket-offline", { result: "reconnecting" });
+    // Queue the message and retry once connected; never silently drop.
+    if (sendQueue.length >= MAX_SEND_QUEUE) {
+      sendQueue.shift(); // drop oldest
+    }
+    sendQueue.push(line);
+    if (!socketOfflineLogged) {
+      debugLog("socket-offline", { result: "reconnecting" });
+      socketOfflineLogged = true;
+    }
     connectControl();
     return;
   }
+  socketOfflineLogged = false;
   try {
-    controlSock.write(JSON.stringify(payload) + "\n");
+    controlSock.write(line);
     debugLog("socket-send", { result: "written" });
   } catch {
     debugLog("socket-send", { result: "write-error" });

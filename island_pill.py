@@ -61,6 +61,10 @@ from island.settings import (  # noqa: E402
     TIMER_PRESETS,
 )
 # -----------------------------------------------------------------------------
+# How long a permission peek (Allow / Deny) stays on screen when nobody
+# answers it.  Used wherever the permission peek duration is set.
+PERMISSION_PEEK_SECONDS = 30
+
 # Pure peek helpers moved verbatim to island/peek.py (Stage 2); the host
 # keeps all peek state and timers.
 from island.peek import (  # noqa: E402
@@ -529,14 +533,16 @@ class Island(Gtk.Window):
         if secs is None:
             secs = PEEK_SECONDS        # read at call time: hand-edit friendly
         if self.open:
-            # The expanded card is showing: queue the event so it can surface
-            # when the card closes instead of being silently discarded.
+            # The expanded card is showing: close it and show the peek
+            # instead of queueing the event for later.
             self.pending_peek = peek_queue_payload(kind, title, body, secs, accent, app)
+            self.set_open(False)
             return
         if not should_show_peek(self.open, HOVER_ONLY_PEEKS):
             return
         self.peek = dict(kind=kind, title=title, body=body, accent=accent, app=app)
         self.peek_on = True
+        self.peek_deadline = time.monotonic() + secs
         self._cancel("peek")
         self._ids["peek"] = once(int(secs * 1000), self._peek_timeout)
         self.retarget()
@@ -562,8 +568,12 @@ class Island(Gtk.Window):
         self.retarget()
         if self.media_playing() or self.batt_state in (1, 5) or self.dl_active:
             self.ensure_visual_tick()
-        if not self.open and not self._ids["open"]:
-            self._ids["open"] = once(HOVER_OPEN_DELAY_MS, self._do_open)
+        # Hover reveals the pill only: the full card opens on pill click,
+        # never on hover.  While a peek is on screen the hover must not
+        # disturb it, so drop its dismiss timer - the pointer over the peek
+        # keeps the peek alive until it is answered or times out.
+        if self.peek_on:
+            self._cancel("peek")
         self.queue_draw()
         return False
 
@@ -571,6 +581,18 @@ class Island(Gtk.Window):
         self._cancel("open")
         if self.open and not self._ids["close"]:
             self._ids["close"] = once(CLOSE_HYSTERESIS_MS, self._do_close)
+        elif self.peek_on:
+            # Pointer left the window: re-arm the peek dismiss timer with
+            # the remaining time so the peek still auto-dismisses after its
+            # timeout (permission peek: PERMISSION_PEEK_SECONDS).
+            remaining = int(
+                (getattr(self, "peek_deadline", time.monotonic()) - time.monotonic())
+                * 1000
+            )
+            if remaining > 0:
+                self._ids["peek"] = once(remaining, self._peek_timeout)
+            else:
+                self.end_peek()
         elif not self.open:
             self.pointer_inside = False
             self.retarget()
@@ -1117,7 +1139,7 @@ class Island(Gtk.Window):
             "opencode-alert",
             "OpenCode · %s" % info.get("project", ""),
             info.get("title", "") + ("\n" + info.get("detail", "") if info.get("detail") else ""),
-            secs=None,
+            secs=PERMISSION_PEEK_SECONDS,
             accent=ORANGE,
             app="OC",
         )

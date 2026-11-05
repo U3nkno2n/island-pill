@@ -202,6 +202,50 @@ test("permission.ask hook alone answers and does not duplicate messages", async 
   assert.equal(out.status, "deny");
 });
 
+test("messages sent while disconnected flush in order after reconnect", async () => {
+  // Drop the control connection and stop listening so sendEvent queues.
+  serverConn.destroy();
+  bridgeServer.close(() => {});
+  await settle(100);
+
+  // Send messages while the control socket is down - they must be queued,
+  // not dropped. Small delays between sends let each failed connectControl
+  // attempt (error -> controlSock = null) complete before the next send.
+  await hooks.event({ event: { type: "permission.asked", properties: { id: "q1", type: "bash", sessionID: "sq1", title: "Q1", pattern: "*", metadata: {} } } });
+  await settle(100);
+  await hooks.event({ event: { type: "permission.asked", properties: { id: "q2", type: "bash", sessionID: "sq2", title: "Q2", pattern: "*", metadata: {} } } });
+  await settle(100);
+  await hooks.event({ event: { type: "permission.asked", properties: { id: "q3", type: "bash", sessionID: "sq3", title: "Q3", pattern: "*", metadata: {} } } });
+  await settle(100);
+
+  // None of the queued messages reached the bridge (server not listening).
+  const before = received.filter(m => m.type === "permission" && ["q1","q2","q3"].includes(m.reqid)).length;
+  assert.equal(before, 0, "no message should reach the bridge while disconnected");
+
+  // Restart the bridge server on the same socket path.
+  try { fs.unlinkSync(socketPath); } catch {}
+  await new Promise((resolve, reject) => {
+    bridgeServer.once("error", reject);
+    bridgeServer.listen(socketPath, resolve);
+  });
+  await settle(100);
+
+  // One more event triggers connectControl, which reconnects and flushes
+  // the queued messages in order.
+  await hooks.event({ event: { type: "permission.asked", properties: { id: "q4", type: "bash", sessionID: "sq4", title: "Q4", pattern: "*", metadata: {} } } });
+
+  // All four messages must arrive in order: q1, q2, q3, q4.
+  await until(() => {
+    const perms = received.filter(m => m.type === "permission" && ["q1","q2","q3","q4"].includes(m.reqid));
+    return perms.length === 4;
+  }, 2000);
+
+  const order = received
+    .filter(m => m.type === "permission" && ["q1","q2","q3","q4"].includes(m.reqid))
+    .map(m => m.reqid);
+  assert.deepEqual(order, ["q1", "q2", "q3", "q4"]);
+});
+
 // ---- teardown ---------------------------------------------------------------
 after(() => {
   try {

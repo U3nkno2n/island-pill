@@ -71,6 +71,7 @@ class BridgeClient:
         self.write_watch_id = 0
         self.timeout_id = 0
         self.active = True
+        self.is_control = False
 
     def close(self):
         if self.timeout_id:
@@ -245,6 +246,11 @@ class OpenCodeBridge:
         return True
 
     def _client_timeout(self, client):
+        # Idle timeout only applies to connections that never identified
+        # as control; a registered control connection lives until the peer
+        # closes it.
+        if client.is_control:
+            return False
         client.close()
         self.clients.pop(client.conn.fileno(), None)
         if self.control_client is client:
@@ -349,6 +355,14 @@ class OpenCodeBridge:
             # it open so the bridge can send opencode.decision messages back.
             self.control_client = client
             client.is_control = True
+            # A registered control connection lives until the peer closes it;
+            # cancel its idle timeout so inactivity never drops it.
+            if client.timeout_id:
+                try:
+                    GLib.source_remove(client.timeout_id)
+                except Exception:
+                    pass
+                client.timeout_id = 0
             self._send_ack(client)
             return
         elif mtype == "opencode":
