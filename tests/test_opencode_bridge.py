@@ -214,6 +214,33 @@ class TestOpenCodeBridge(unittest.TestCase):
         self.assertEqual(len(self.win.peek_calls), 2)
         self.assertEqual(self.win.peek_calls[1][0], "opencode")
 
+    # ------------------------------------------------- session state table -
+
+    def test_session_callback_state_mapping(self):
+        infos = []
+        self.bridge.register_session_callback(lambda info: infos.append(info))
+        client = FakeClient()
+        for etype, state in (("started", "working"), ("working", "working"),
+                             ("permission", "approval"), ("done", "done"),
+                             ("failed", "failed"), ("cancelled", "failed")):
+            self._handle(client, {
+                "type": etype, "session": "s1", "project": "proj", "ts": 1000.0,
+            })
+        self.assertEqual([(i["state"], i["session"], i["project"]) for i in infos],
+                         [("working", "s1", "proj"), ("working", "s1", "proj"),
+                          ("approval", "s1", "proj"), ("done", "s1", "proj"),
+                          ("failed", "s1", "proj"), ("failed", "s1", "proj")])
+
+    def test_session_callback_fires_when_peek_deduped(self):
+        """The session callbacks fire even when the peek is dedup-suppressed."""
+        infos = []
+        self.bridge.register_session_callback(lambda info: infos.append(info))
+        client = FakeClient()
+        self._handle(client, {"type": "done", "session": "s1", "ts": 1000.0})
+        self._handle(client, {"type": "done", "session": "s1", "ts": 1000.1})
+        self.assertEqual(len(self.win.peek_calls), 1)   # peek deduped
+        self.assertEqual(len(infos), 2)                 # state still updated
+
     # ------------------------------------------------- control connection --
 
     def test_control_identify(self):

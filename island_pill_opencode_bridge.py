@@ -43,6 +43,16 @@ INFO_SECS = 4
 ALERT_SECS = 12
 ERROR_SECS = 10
 
+# Bridge events -> live session state on the host's OpenCode tab.
+_OC_SESSION_STATE = {
+    "started": "working",
+    "working": "working",
+    "permission": "approval",
+    "done": "done",
+    "failed": "failed",
+    "cancelled": "failed",
+}
+
 WHITE = (1, 1, 1, 1)
 BLUE = (0.35, 0.62, 1.0, 1)
 ORANGE = (1.0, 0.62, 0.10, 1)
@@ -103,6 +113,7 @@ class OpenCodeBridge:
         self.pending_permissions = {}  # (sessionID, permissionID) -> {project, title, detail, kind}
         self.working_sessions = set()  # sessions that already showed their one "working" peek
         self.decision_callback = None  # host callback: (permissionID, decision) -> None
+        self.session_callback = None  # host callback: info dict -> False/None
 
     # ---------------------------------------------------------------- setup ----
 
@@ -308,6 +319,15 @@ class OpenCodeBridge:
         session = str(msg.get("session", ""))[:100]
         permission_id = str(msg.get("reqid", msg.get("permissionID", "")))[:100]
 
+        # Feed the host's live session table (OpenCode tab).  These rows are
+        # event-driven, so also fire when the peek itself is dedup-suppressed.
+        if self.session_callback is not None and session:
+            state = _OC_SESSION_STATE.get(mtype)
+            if state is not None:
+                GLib.idle_add(self.session_callback,
+                              {"session": session, "project": project,
+                               "state": state, "ts": time.monotonic()})
+
         # Dedup with a per-key TTL, separate from Pill's last_notif.
         key = (mtype, session)
         now = time.monotonic()
@@ -498,6 +518,13 @@ class OpenCodeBridge:
         Signature: cb(info) where info is a dict with keys:
         type="register", permission_id, project, title, detail."""
         self.decision_callback = cb
+
+    def register_session_callback(self, cb):
+        """Register a host callback invoked when a session event updates the
+        live OpenCode session table.  Signature: cb(info) where info is a dict
+        with keys session, project, state, ts.  The callback must return
+        False (or None) so the GLib.idle_add that invokes it never repeats."""
+        self.session_callback = cb
 
     def _send_decision(self, session, permission_id, decision):
         """Send an opencode.decision message to the OpenCode plugin over the

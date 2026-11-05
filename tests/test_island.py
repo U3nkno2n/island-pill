@@ -636,6 +636,7 @@ class TestOpenTabsHeadless(unittest.TestCase):
         self.win = island_pill.Island.__new__(island_pill.Island)
         self.win.open_tab = "Home"
         self.win.hits = []
+        self.win.oc_sessions = {}
         self.win.current_player = lambda: None
         self.win.cpu_pct = None
         self.win.mem_used = None
@@ -794,6 +795,132 @@ class TestOpenSystemStatesHeadless(unittest.TestCase):
     def test_system_timer_done(self):
         self.win.timer_end = time.monotonic() - 60.0
         self._draw()
+
+
+class TestOpenSessionsHeadless(unittest.TestCase):
+    """Headless OpenCode tab draws over the live session rows: sizes, states,
+    ordering, long names, the draw-time staleness rule and the prune logic."""
+
+    def setUp(self):
+        self.win = island_pill.Island.__new__(island_pill.Island)
+        self.win.open_tab = "OpenCode"
+        self.win.hits = []
+        self.win.oc_sessions = {}
+        self.win.current_player = lambda: None
+        self.win.queue_draw = lambda: None
+
+    def _draw(self):
+        surf = cairo.ImageSurface(cairo.FORMAT_ARGB32,
+                                  island_pill.WIN_W, island_pill.WIN_H)
+        cr = cairo.Context(surf)
+        self.win.draw_open(cr)
+
+    def _draw_collect(self):
+        """draw_open with the island-side drawing helpers recorded, so dot
+        colours and drawn row texts can be asserted."""
+        surf = cairo.ImageSurface(cairo.FORMAT_ARGB32,
+                                  island_pill.WIN_W, island_pill.WIN_H)
+        cr = cairo.Context(surf)
+        dots, texts = [], []
+        orig_dot, orig_text = island_pill.state_dot, island_pill.draw_text
+        island_pill.state_dot = lambda cr, cx, cy, r, color: dots.append((cx, cy, color))
+
+        def text_stub(cr, s, x, cy, size, color, bold=False, width=None, align=0):
+            texts.append((s, color))
+        island_pill.draw_text = text_stub
+        try:
+            self.win.draw_open(cr)
+        finally:
+            island_pill.state_dot = orig_dot
+            island_pill.draw_text = orig_text
+        return dots, texts
+
+    def test_draw_zero_sessions(self):
+        self._draw()   # "No sessions yet" line
+
+    def test_draw_one_session(self):
+        self.win.oc_sessions["s1"] = {
+            "project": "proj", "state": "working", "ts": time.monotonic(),
+        }
+        self._draw()
+
+    def test_draw_six_sessions_all_states(self):
+        now = time.monotonic()
+        self.win.oc_sessions = {
+            "a1": {"project": "preset", "state": "approval", "ts": now - 1},
+            "a2": {"project": "deploy", "state": "approval", "ts": now - 2},
+            "w1": {"project": "alpha", "state": "working", "ts": now - 3},
+            "w2": {"project": "beta", "state": "working", "ts": now - 4},
+            "d1": {"project": "gamma", "state": "done", "ts": now - 5},
+            "f1": {"project": "delta", "state": "failed", "ts": now - 6},
+        }
+        self._draw()
+
+    def test_draw_eight_sessions(self):
+        now = time.monotonic()
+        states = ("approval", "working", "done", "failed")
+        self.win.oc_sessions = {
+            "s%d" % i: {"project": "session project %d" % i,
+                        "state": states[i % 4], "ts": now - i}
+            for i in range(8)
+        }
+        self._draw()
+
+    def test_draw_long_names(self):
+        self.win.oc_sessions["s1"] = {
+            "project": "opencode-project-with-a-hundred-character-name-that-must"
+                       "-ellipsize-under-the-state-column-without-raising",
+            "state": "working", "ts": time.monotonic(),
+        }
+        self._draw()
+
+    def test_row_order(self):
+        """approval first, then working, then done/failed; newest first within."""
+        now = time.monotonic()
+        self.win.oc_sessions = {
+            "w1": {"project": "a", "state": "working", "ts": now - 10},
+            "a1": {"project": "b", "state": "approval", "ts": now - 20},
+            "d1": {"project": "c", "state": "done", "ts": now - 5},
+            "w2": {"project": "d", "state": "working", "ts": now - 2},
+            "f1": {"project": "e", "state": "failed", "ts": now - 1},
+        }
+        self.assertEqual([k for k, _ in self.win._oc_session_rows()],
+                         ["a1", "w2", "w1", "f1", "d1"])
+
+    def test_prune_drops_done_first_then_oldest(self):
+        """8 events -> <=6 rows; a done row is dropped before the oldest row."""
+        for i in range(5):
+            self.win.oc_sessions_update({"session": "w%d" % i, "project": "p",
+                                         "state": "working", "ts": float(i) + 1.0})
+        self.win.oc_sessions_update({"session": "done1", "project": "p",
+                                     "state": "done", "ts": 0.5})
+        self.assertEqual(len(self.win.oc_sessions), 6)
+        # 7th insert: the finished row (oldest of its group) goes first
+        self.win.oc_sessions_update({"session": "w9", "project": "p",
+                                     "state": "working", "ts": 100.0})
+        self.assertEqual(len(self.win.oc_sessions), 6)
+        self.assertNotIn("done1", self.win.oc_sessions)
+        # 8th insert: no finishers left -> the oldest overall row goes
+        self.win.oc_sessions_update({"session": "w10", "project": "p",
+                                     "state": "working", "ts": 101.0})
+        self.assertEqual(len(self.win.oc_sessions), 6)
+        self.assertNotIn("w0", self.win.oc_sessions)   # ts 1.0 = oldest working
+
+    def test_update_returns_false(self):
+        """The idle_add-registered callback must return False (never repeat)."""
+        ret = self.win.oc_sessions_update({"session": "s1", "project": "p",
+                                           "state": "working", "ts": 1.0})
+        self.assertFalse(ret)
+
+    def test_stale_working_draws_idle_with_dim_dot(self):
+        """A working row older than OC_STALE_AFTER paints dim 'Idle'."""
+        self.win.oc_sessions["s1"] = {
+            "project": "proj", "state": "working",
+            "ts": time.monotonic() - island_pill.OC_STALE_AFTER - 1.0,
+        }
+        dots, texts = self._draw_collect()
+        self.assertIn("Idle", [s for s, _color in texts])
+        self.assertTrue(any(color == (1, 1, 1, 0.12) for _x, _y, color in dots))
 
 
 class TestOpenHeightMax(unittest.TestCase):
