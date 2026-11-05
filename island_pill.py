@@ -121,7 +121,7 @@ from island.rendering import (  # noqa: E402
     rounded_rect, shape_path, _layout, measure, draw_text, glyph_tri,
     glyph_skip, glyph_pause, draw_bars, draw_battery, draw_clock_icon,
     draw_bt_glyph, draw_wifi_glyph, draw_down_arrow, progress_bar,
-    indeterminate_bar, tab_pill, card,
+    indeterminate_bar, tab_pill, card, CARD,
 )
 
 
@@ -239,6 +239,7 @@ class Island(Gtk.Window):
         self.hits = []
         self.open_tab = "Home"
         self._sec_warned = False
+        self._paint_warned = False
         self.timer_end = None
         self.timer_mins = 0
         self._media = MediaPlayer(self)   # MPRIS tracker; host = self
@@ -1359,7 +1360,15 @@ class Island(Gtk.Window):
             alpha = max(0.0, 1.0 - dist * 4.0)
             if alpha > 0.01:
                 cr.push_group()
-                fn(cr)
+                try:
+                    fn(cr)
+                except Exception:
+                    # A failed layer must not kill the draw cycle nor leave the
+                    # group stack unbalanced: pop the partial group anyway so
+                    # whatever got drawn (e.g. the tab row) still shows.
+                    if not self._paint_warned:
+                        self._paint_warned = True
+                        traceback.print_exc()
                 cr.pop_group_to_source()
                 cr.paint_with_alpha(alpha)
         cr.restore()

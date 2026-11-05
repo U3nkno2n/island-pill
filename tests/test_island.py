@@ -676,6 +676,126 @@ class TestOpenTabsHeadless(unittest.TestCase):
         self._draw()
 
 
+class TestOpenTilesHeadless(unittest.TestCase):
+    """Home tab tile states must all draw on a cairo ImageSurface without
+    raising (regression: the missing CARD import raised NameError in _tile
+    for off tiles and killed the whole Home tab)."""
+
+    def setUp(self):
+        self.win = island_pill.Island.__new__(island_pill.Island)
+        self.win.open_tab = "Home"
+        self.win.hits = []
+        self.win.current_player = lambda: None
+        self.win.timer_end = None
+        self.win.dl_phase = 0.5
+        self.win.dl_rate = 0.0
+        self.win.dl_name = None
+        self.win.dl_bytes = 0
+        self.win.dl_bar = lambda: (0.42, (0.35, 0.62, 1.0, 1.0), True)
+        self.win.retarget = lambda: None
+        self.win.queue_draw = lambda: None
+        self.win.get_mapped = lambda: False
+
+    def _apply(self, wifi, bt, dl):
+        win = self.win
+        win.dl_active = dl
+        win.has_conn = lambda: bool(wifi) or bt is not None
+        if wifi:
+            win.wdev = object()
+            win.wifi_summary = lambda: (wifi["label"], wifi["color"])
+            win.wifi_level = lambda: 2
+            win.wifi_on = wifi["on"]
+            win.wifi_note = wifi["note"]
+        else:
+            win.wdev = None
+        if bt:
+            win.bt_powered = bt["on"]
+            win.bt_note = bt["note"]
+            win.bt_summary = lambda: (bt["label"], bt["color"])
+        else:
+            win.bt_powered = None
+
+    def _draw(self):
+        surf = cairo.ImageSurface(cairo.FORMAT_ARGB32,
+                                  island_pill.WIN_W, island_pill.WIN_H)
+        cr = cairo.Context(surf)
+        self.win.draw_open(cr)
+
+    def test_tile_states_draw(self):
+        WHITE = (1, 1, 1, 1)
+        ORANGE = (1.0, 0.62, 0.10, 1)
+        GREEN = (0.20, 0.84, 0.45, 1)
+        LONG = "A very long network and device name that must ellipsize"
+        wifi_on = dict(label="TP-Link_5G", color=WHITE, on=True, note=False)
+        wifi_off = dict(label="TP-Link_5G", color=WHITE, on=False, note=False)
+        wifi_lost = dict(label="Not connected", color=ORANGE, on=True, note=True)
+        bt_ok = dict(label="Bluetooth", color=WHITE, on=True, note=False)
+        bt_off = dict(label="Bluetooth", color=WHITE, on=False, note=False)
+        bt_dev = dict(label="Pixel Buds (connected)", color=GREEN, on=True, note=False)
+        bt_long = dict(label=LONG, color=GREEN, on=True, note=False)
+        wifi_long = dict(label=LONG, color=WHITE, on=True, note=False)
+        scenarios = [
+            ("wifi on", dict(wifi=wifi_on, bt=None, dl=False)),
+            ("wifi off", dict(wifi=wifi_off, bt=None, dl=False)),
+            ("wifi not connected", dict(wifi=wifi_lost, bt=None, dl=False)),
+            ("bt unavailable", dict(wifi=None, bt=None, dl=False)),
+            ("bt on", dict(wifi=None, bt=bt_ok, dl=False)),
+            ("bt off", dict(wifi=None, bt=bt_off, dl=False)),
+            ("bt device connected", dict(wifi=None, bt=bt_dev, dl=False)),
+            ("long wifi name", dict(wifi=wifi_long, bt=None, dl=False)),
+            ("long device name", dict(wifi=None, bt=bt_long, dl=False)),
+            ("both tiles with download", dict(wifi=wifi_on, bt=bt_ok, dl=True)),
+            ("download only", dict(wifi=None, bt=None, dl=True)),
+        ]
+        for name, sc in scenarios:
+            with self.subTest(state=name):
+                self._apply(**sc)
+                self._draw()
+
+
+class TestOpenSystemStatesHeadless(unittest.TestCase):
+    """Headless System tab draws for the three timer states: no timer,
+    a timer running and a timer finished (elapsed clamps to 0:00)."""
+
+    def setUp(self):
+        self.win = island_pill.Island.__new__(island_pill.Island)
+        self.win.open_tab = "System"
+        self.win.hits = []
+        self.win.current_player = lambda: None
+        self.win.cpu_pct = None
+        self.win.mem_used = None
+        self.win.mem_total = None
+        self.win.temp_cached = None
+        self.win.batt_pct = None
+        self.win.batt_state = None
+        self.win.batt_draw_pct = None
+        self.win.charge_phase = 0.0
+        self.win.has_conn = lambda: False
+        self.win.retarget = lambda: None
+        self.win.queue_draw = lambda: None
+        self.win.get_mapped = lambda: False
+        self.win.dl_active = False
+        self.win.dl_phase = 0.0
+
+    def _draw(self):
+        surf = cairo.ImageSurface(cairo.FORMAT_ARGB32,
+                                  island_pill.WIN_W, island_pill.WIN_H)
+        cr = cairo.Context(surf)
+        self.win.draw_open(cr)
+
+    def test_system_no_timer(self):
+        self.win.timer_end = None
+        self._draw()
+
+    def test_system_timer_running(self):
+        self.win.timer_end = time.monotonic() + 300.0
+        self._draw()
+
+    def test_system_timer_done(self):
+        self.win.timer_end = time.monotonic() - 60.0
+        self._draw()
+
+
 class TestOpenHeightMax(unittest.TestCase):
     """Every tab's height must fit inside OPEN_H_MAX; Home with the
     Wi-Fi/Bluetooth and download rows showing must be exactly OPEN_H_MAX;

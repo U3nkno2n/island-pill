@@ -27,6 +27,9 @@ debugLog("plugin-loaded", { export: "server" });
 const pending = new Map();
 // dedup key -> timestamp
 const dedup = new Map();
+// Sessions that already announced their one "working" peek for the current
+// turn: further activity events stay silent until the turn ends.
+const busy = new Set();
 
 const now = () => Date.now();
 
@@ -245,14 +248,12 @@ export const server = async ({ project, client, directory, worktree }) => {
       if (type === "message.part.updated" ||
           type === "tool.execute.before" ||
           type === "tool.execute.after") {
-        const key = dedupKey(type, sessionID, properties.id || "");
-        if (!isStale(key)) {
-          debugLog("event-ignored", { reason: "dedup-hit", type, sessionID });
+        // One "working" peek when the turn starts; silence while it continues.
+        if (busy.has(sessionID)) {
+          debugLog("event-ignored", { reason: "session-busy", type, sessionID });
           return;
         }
-        markDedup(key);
-        const toolName = properties.tool || properties.name || "tool";
-        const detail = properties.input || properties.output || "";
+        busy.add(sessionID);
         debugLog("notify-called", { ntype: "opencode", sessionID });
         sendEvent({
           type: "working",
@@ -260,7 +261,7 @@ export const server = async ({ project, client, directory, worktree }) => {
           reqid: properties.id || "",
           project: projectName,
           title: "OpenCode · Working",
-          body: toolName + (detail ? ": " + String(detail).slice(0, 80) : ""),
+          body: projectName,
           ts: Date.now(),
         });
         return;
@@ -369,6 +370,7 @@ export const server = async ({ project, client, directory, worktree }) => {
 
       // ---------- session error ----------
       if (type === "session.error") {
+        busy.delete(sessionID);
         const errorName = (properties.error && properties.error.name) || "Error";
         const errorMsg =
           properties.error &&
@@ -397,6 +399,7 @@ export const server = async ({ project, client, directory, worktree }) => {
 
       // ---------- session idle (completion) ----------
       if (type === "session.idle") {
+        busy.delete(sessionID);   // the working phase is over either way
         // Suppress if the session is awaiting user input.
         const s = pending.get(sessionID);
         if (s && s.size > 0) {
@@ -424,6 +427,7 @@ export const server = async ({ project, client, directory, worktree }) => {
 
       // ---------- session status idle (completion) ----------
       if (type === "session.status" && properties.status && properties.status.type === "idle") {
+        busy.delete(sessionID);   // the working phase is over either way
         // Suppress if the session is awaiting user input.
         const s = pending.get(sessionID);
         if (s && s.size > 0) {

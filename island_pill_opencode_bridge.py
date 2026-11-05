@@ -101,6 +101,7 @@ class OpenCodeBridge:
         self.last_peek = {}  # dedup key -> timestamp
         self.pending = {}  # sessionID -> set of requestIDs awaiting input
         self.pending_permissions = {}  # (sessionID, permissionID) -> {project, title, detail, kind}
+        self.working_sessions = set()  # sessions that already showed their one "working" peek
         self.decision_callback = None  # host callback: (permissionID, decision) -> None
 
     # ---------------------------------------------------------------- setup ----
@@ -352,6 +353,14 @@ class OpenCodeBridge:
             secs = INFO_SECS
             body = body or "OpenCode started working"
         elif mtype == "working":
+            # Safety net: one "working" peek per session while it is busy.
+            # Further "working" messages are ACKed but dropped until a
+            # done / failed / cancelled message for it ends the turn.
+            if session and session in self.working_sessions:
+                self._send_ack(client)
+                return
+            if session:
+                self.working_sessions.add(session)
             kind = "opencode"
             accent = BLUE
             secs = INFO_SECS
@@ -361,18 +370,21 @@ class OpenCodeBridge:
             secs = INFO_SECS
             title = title or "OpenCode"
             body = body or "Response completed"
+            self.working_sessions.discard(session)
         elif mtype == "failed":
             kind = "opencode-error"
             accent = ORANGE
             secs = ERROR_SECS
             title = title or "OpenCode"
             body = body or "Request failed"
+            self.working_sessions.discard(session)
         elif mtype == "cancelled":
             kind = "opencode-error"
             accent = ORANGE
             secs = ERROR_SECS
             title = title or "OpenCode"
             body = body or "Request cancelled"
+            self.working_sessions.discard(session)
         elif mtype == "permission":
             kind = "opencode-alert"
             accent = ORANGE
