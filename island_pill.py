@@ -73,14 +73,15 @@ IDLE_H = 30 if NOTCH else 34
 DL_EXTRA = 6                     # extra idle height while the download bar is showing (px)
 PEEK_W, PEEK_H = 360, 58
 OPEN_W = 400
-OPEN_H_BASE = 148                # media / clock row + divider (Home base)
 TAB_ROW_H = 36                   # tab row at the top of the open card
-ROW_CONN_H = 34                  # Wi-Fi + Bluetooth row (only if either exists)
-ROW_DL_H = 40                    # download row (only while downloading)
+ROW_A_H = 64                     # media / clock row band on Home (divider at its bottom)
+OPEN_H_BASE = TAB_ROW_H + ROW_A_H + 16   # Home base: tab row + media/clock row + padding
+ROW_CONN_H = 34                  # Wi-Fi + Bluetooth chips row on Home (only if either exists)
+ROW_DL_H = 41                    # download row on Home (only while downloading)
 SYSTEM_CONTENT_H = 84            # stats + timer rows below the tab row
 OPENCODE_CONTENT_H = 84          # "No sessions yet" card below the tab row
-OPEN_H_MAX = OPEN_H_BASE + TAB_ROW_H + ROW_CONN_H + ROW_DL_H
-OPEN_MIN_H = min(OPEN_H_BASE + TAB_ROW_H,
+OPEN_H_MAX = OPEN_H_BASE + ROW_CONN_H + ROW_DL_H
+OPEN_MIN_H = min(OPEN_H_BASE,
                  TAB_ROW_H + SYSTEM_CONTENT_H,
                  TAB_ROW_H + OPENCODE_CONTENT_H)
 WIN_W = OPEN_W + 60
@@ -413,7 +414,7 @@ class Island(Gtk.Window):
 
     def open_h(self):
         if self.open_tab == "Home":
-            return (OPEN_H_BASE + TAB_ROW_H + (ROW_CONN_H if self.has_conn() else 0)
+            return (OPEN_H_BASE + (ROW_CONN_H if self.has_conn() else 0)
                     + (ROW_DL_H if self.dl_active else 0))
         if self.open_tab == "System":
             return TAB_ROW_H + SYSTEM_CONTENT_H
@@ -1541,13 +1542,14 @@ class Island(Gtk.Window):
             draw_text(cr, time.strftime("%A, %d %b"), right, oy + 33, 10.5, DIM, align=2)
 
         cr.set_source_rgba(*FAINT)
-        cr.rectangle(left, oy + 64, right - left, 1)
+        cr.rectangle(left, oy + ROW_A_H, right - left, 1)
         cr.fill()
 
-        # row D: Wi-Fi and Bluetooth buttons (tap to switch on / off), in the
-        # same slot the timer row held below it on the old card
+        # row D: Wi-Fi and Bluetooth chips (tap to switch on / off), directly
+        # under the divider: 8 px gap, 26 px chip, band of ROW_CONN_H
+        last = oy + ROW_A_H
         if self.has_conn():
-            cy = oy + 152
+            cy = last + 21
             x = left
             if self.wdev is not None:
                 label, color = self.wifi_summary()
@@ -1563,9 +1565,10 @@ class Island(Gtk.Window):
                 self.conn_chip(cr, x, cy, label, color, on, draw_bt_glyph, self.bt_toggle)
             last = cy
         else:
-            # no chips row: anchor at the slot the timer row used to leave,
-            # so the download keeps its old position
-            last = oy + 118
+            # no chips row: draw_download hangs its section divider 23 px below
+            # the anchor and 10 px below the previous row's bottom edge, so the
+            # anchor goes 13 px up to slot the section directly under the divider
+            last -= 13
 
         # row E: download, only while one is running
         if self.dl_active:
