@@ -74,10 +74,15 @@ DL_EXTRA = 6                     # extra idle height while the download bar is s
 PEEK_W, PEEK_H = 360, 58
 OPEN_W = 400
 TAB_ROW_H = 36                   # tab row at the top of the open card
-ROW_A_H = 64                     # media / clock row band on Home (divider at its bottom)
-OPEN_H_BASE = TAB_ROW_H + ROW_A_H + 16   # Home base: tab row + media/clock row + padding
-ROW_CONN_H = 34                  # Wi-Fi + Bluetooth chips row on Home (only if either exists)
-ROW_DL_H = 41                    # download row on Home (only while downloading)
+HOME_GAP = 8                     # gap between stacked cards on Home
+HOME_CARD_PAD = 12               # inner padding inside every Home card
+MUSIC_CARD_H = 64                # music / clock card on Home
+TILE_H = 40                      # Wi-Fi / Bluetooth tile height
+DL_CARD_H = 48                   # download card on Home (only while downloading)
+HOME_PAD_B = 12                  # bottom padding after Home's last card
+OPEN_H_BASE = TAB_ROW_H + MUSIC_CARD_H + HOME_PAD_B   # Home base, incl. tab row
+ROW_CONN_H = HOME_GAP + TILE_H   # tiles row growth on Home (only if either exists)
+ROW_DL_H = HOME_GAP + DL_CARD_H  # download row growth on Home (only while downloading)
 SYSTEM_CONTENT_H = 84            # stats + timer rows below the tab row
 OPENCODE_CONTENT_H = 84          # "No sessions yet" card below the tab row
 OPEN_H_MAX = OPEN_H_BASE + ROW_CONN_H + ROW_DL_H
@@ -1449,17 +1454,15 @@ class Island(Gtk.Window):
             self.hits.append((dx, by, bw, bh,
                               lambda *_: self.opencode_decision(pid, "deny")))
 
-    def conn_chip(self, cr, x, cy, label, color, on, icon, fn, maxw=110):
-        """Button with an icon and a label (Wi-Fi, Bluetooth). Returns its width."""
-        h = 26
-        w = int(min(measure(label, 9.5, True), maxw)) + 38
-        cr.set_source_rgba(*((0.35, 0.62, 1.0, 0.20) if on else FAINT))
-        rounded_rect(cr, x, cy - h / 2.0, w, h, h / 2.0)
-        cr.fill()
-        icon(cr, x + 15, cy, BLUE if on else DIM)
-        draw_text(cr, label, x + 27, cy, 9.5, color, bold=True, width=maxw)
-        self.hits.append((x, cy - h / 2.0, w, h, fn))
-        return w
+    def _tile(self, cr, x, y, w, h, label, color, on, icon, fn):
+        """Wi-Fi / Bluetooth tile: rounded card with a glyph and its name
+        (ellipsized). The whole tile is the hit target and taps through to
+        the same toggle (`fn`) the old chips used."""
+        card(cr, x, y, w, h, 14, (0.35, 0.62, 1.0, 0.20) if on else CARD)
+        icon(cr, x + 15, y + h / 2.0, BLUE if on else DIM)
+        draw_text(cr, label, x + 27, y + h / 2.0, 9.5, color, bold=True,
+                  width=max(30, w - 27 - HOME_CARD_PAD))
+        self.hits.append((x, y, w, h, fn))
 
     def chip(self, cr, x, cy, w, label, fn, fg=WHITE, bg=FAINT):
         h = 26
@@ -1521,58 +1524,59 @@ class Island(Gtk.Window):
         self.queue_draw()
 
     def _draw_home(self, cr, oy, left, right, cur):
-        # row A: media, or big clock + date
+        # music card: media controls while something plays, big clock + date otherwise
+        card(cr, left, oy, right - left, MUSIC_CARD_H)
+        by = oy + MUSIC_CARD_H / 2.0
         if cur:
             p = cur[1]
-            by = oy + 34
             playing = p["status"] == "Playing"
-            text_left = left
+            text_left = left + HOME_CARD_PAD
             if playing:
-                draw_bars(cr, left, by - 1, GREEN, self.music_phase)
+                draw_bars(cr, text_left, by - 1, GREEN, self.music_phase)
                 text_left += 20
             draw_text(cr, p["title"] or "Unknown", text_left, by - 9, 11, WHITE, bold=True,
-                      width=OPEN_W - 172)
-            draw_text(cr, p["artist"] or p["status"], text_left, by + 10, 9, DIM, width=OPEN_W - 172)
+                      width=OPEN_W - 184)
+            draw_text(cr, p["artist"] or p["status"], text_left, by + 10, 9, DIM,
+                      width=OPEN_W - 184)
             self.round_button(cr, right - 105, by, 15, "prev", lambda: self.mpris_call("Previous"))
             self.round_button(cr, right - 68, by, 17, "pause" if playing else "play",
                               lambda: self.mpris_call("PlayPause"), solid=True)
             self.round_button(cr, right - 30, by, 15, "next", lambda: self.mpris_call("Next"))
         else:
-            draw_text(cr, clock_text(), left, oy + 33, 20, WHITE, bold=True)
-            draw_text(cr, time.strftime("%A, %d %b"), right, oy + 33, 10.5, DIM, align=2)
+            draw_text(cr, clock_text(), left + HOME_CARD_PAD, by, 20, WHITE, bold=True)
+            draw_text(cr, time.strftime("%A, %d %b"), right - HOME_CARD_PAD, by, 10.5, DIM,
+                      align=2)
 
-        cr.set_source_rgba(*FAINT)
-        cr.rectangle(left, oy + ROW_A_H, right - left, 1)
-        cr.fill()
-
-        # row D: Wi-Fi and Bluetooth chips (tap to switch on / off), directly
-        # under the divider: 8 px gap, 26 px chip, band of ROW_CONN_H
-        last = oy + ROW_A_H
+        # Wi-Fi and Bluetooth tiles (tap to switch on / off), side by side
+        y = oy + MUSIC_CARD_H
         if self.has_conn():
-            cy = last + 21
-            x = left
+            tiles = []
             if self.wdev is not None:
                 label, color = self.wifi_summary()
                 on = bool(self.wifi_on) and not self.wifi_note
                 lvl = self.wifi_level()
-                x += self.conn_chip(
-                    cr, x, cy, label, color, on,
-                    lambda c, ix, iy, col: draw_wifi_glyph(c, ix, iy, col, lvl),
-                    self.wifi_toggle) + 8
+                tiles.append((label, color, on,
+                              lambda c, ix, iy, col: draw_wifi_glyph(c, ix, iy, col, lvl),
+                              self.wifi_toggle))
             if self.bt_powered is not None:
                 label, color = self.bt_summary()
                 on = bool(self.bt_powered) and not self.bt_note
-                self.conn_chip(cr, x, cy, label, color, on, draw_bt_glyph, self.bt_toggle)
-            last = cy
-        else:
-            # no chips row: draw_download hangs its section divider 23 px below
-            # the anchor and 10 px below the previous row's bottom edge, so the
-            # anchor goes 13 px up to slot the section directly under the divider
-            last -= 13
+                tiles.append((label, color, on, draw_bt_glyph, self.bt_toggle))
+            if tiles:
+                tt = y + HOME_GAP
+                tx = left
+                if len(tiles) == 1:
+                    tw = right - left             # a lone tile takes the full width
+                else:
+                    tw = (right - left - HOME_GAP) / 2.0
+                for label, color, on, icon, fn in tiles:
+                    self._tile(cr, tx, tt, tw, TILE_H, label, color, on, icon, fn)
+                    tx += tw + HOME_GAP
+                y = tt + TILE_H
 
-        # row E: download, only while one is running
+        # download card, only while one is running
         if self.dl_active:
-            self.draw_download(cr, left, right, last)
+            self.draw_download(cr, left, right, y + HOME_GAP)
 
     def _draw_opencode(self, cr, oy, left, right):
         # one card, centred text, until real session rows land here
@@ -1621,11 +1625,8 @@ class Island(Gtk.Window):
             draw_text(cr, clock_text(), right, cy, 10, DIM, align=2)
 
     def draw_download(self, cr, left, right, last):
-        """File name, speed and bar. `last` is the vertical centre of the row above."""
-        cy = last + 37
-        cr.set_source_rgba(*FAINT)
-        cr.rectangle(left, last + 23, right - left, 1)
-        cr.fill()
+        """Download card: file name, speed and bar. `last` is the card's top y."""
+        card(cr, left, last, right - left, DL_CARD_H)
         fill, col, known = self.dl_bar()
         speed = fmt_rate(self.dl_rate or 0.0)
         if known:
@@ -1633,14 +1634,17 @@ class Island(Gtk.Window):
         else:
             info = "%s · %s received" % (speed, fmt_size(self.dl_bytes))
         iw = measure(info, 9.5, True)
-        draw_down_arrow(cr, left + 5, cy, col, 0.9)
-        draw_text(cr, info, right, cy, 9.5, WHITE, bold=True, align=2)
-        draw_text(cr, self.dl_name or "Downloading", left + 17, cy, 9.5, DIM,
-                  width=max(30, right - left - 17 - iw - 10))
+        cy = last + 19
+        draw_down_arrow(cr, left + HOME_CARD_PAD + 5, cy, col, 0.9)
+        draw_text(cr, info, right - HOME_CARD_PAD, cy, 9.5, WHITE, bold=True, align=2)
+        draw_text(cr, self.dl_name or "Downloading", left + HOME_CARD_PAD + 17, cy, 9.5, DIM,
+                  width=max(30, right - left - 2 * HOME_CARD_PAD - 17 - iw - 10))
         if known:
-            progress_bar(cr, left, last + 50, right - left, 4, fill, col)
+            progress_bar(cr, left + HOME_CARD_PAD, last + 32, right - left - 2 * HOME_CARD_PAD,
+                         4, fill, col)
         else:
-            indeterminate_bar(cr, left, last + 50, right - left, 4, self.dl_phase, col)
+            indeterminate_bar(cr, left + HOME_CARD_PAD, last + 32,
+                              right - left - 2 * HOME_CARD_PAD, 4, self.dl_phase, col)
 
 
 # -------------------------------------------------------------------- main ----
