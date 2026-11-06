@@ -202,6 +202,53 @@ test("permission.ask hook alone answers and does not duplicate messages", async 
   assert.equal(out.status, "deny");
 });
 
+test("announceClosed sends closed for each seen session", async () => {
+  await hooks.event({ event: { type: "session.created", properties: { sessionID: "ac_ses_a", id: "ac_ses_a" } } });
+  await hooks.event({ event: { type: "session.created", properties: { sessionID: "ac_ses_b", id: "ac_ses_b" } } });
+  // Empty session id must not be recorded.
+  await hooks.event({ event: { type: "session.created", properties: { sessionID: "", id: "" } } });
+
+  plugin.server.announceClosed();
+  await settle(50);
+
+  const closedMsgs = received.filter(m => m.type === "closed" && ["ac_ses_a", "ac_ses_b"].includes(m.session));
+  assert.equal(closedMsgs.length, 2, "each seen session must get a closed message");
+  assert.ok(closedMsgs.some(m => m.session === "ac_ses_a"));
+  assert.ok(closedMsgs.some(m => m.session === "ac_ses_b"));
+});
+
+test("session.deleted announces only the deleted session", async () => {
+  await hooks.event({ event: { type: "session.created", properties: { sessionID: "sd_ses_x", id: "sd_ses_x" } } });
+  await hooks.event({ event: { type: "session.created", properties: { sessionID: "sd_ses_y", id: "sd_ses_y" } } });
+
+  // Delete only ses_x via info.id
+  await hooks.event({ event: { type: "session.deleted", properties: { info: { id: "sd_ses_x" }, sessionID: "sd_ses_x" } } });
+  await settle(50);
+
+  const closedMsgs = received.filter(m => m.type === "closed" && ["sd_ses_x", "sd_ses_y"].includes(m.session));
+  assert.equal(closedMsgs.length, 1, "session.deleted must announce only the deleted session");
+  assert.equal(closedMsgs[0].session, "sd_ses_x");
+});
+
+test("session.deleted falls back to sessionID when info.id is missing", async () => {
+  await hooks.event({ event: { type: "session.created", properties: { sessionID: "sd_ses_z", id: "sd_ses_z" } } });
+
+  await hooks.event({ event: { type: "session.deleted", properties: { sessionID: "sd_ses_z" } } });
+  await settle(50);
+
+  const closedMsgs = received.filter(m => m.type === "closed" && m.session === "sd_ses_z");
+  assert.equal(closedMsgs.length, 1, "session.deleted must fall back to properties.sessionID");
+});
+
+test("permission.replied is forwarded to the island", async () => {
+  await hooks.event({ event: { type: "permission.replied", properties: { requestID: "pr_1", sessionID: "ses_r" } } });
+
+  const msg = await waitFor((m) => m.type === "permission.replied" && m.session === "ses_r" && m.reqid === "pr_1");
+  assert.equal(msg.type, "permission.replied");
+  assert.equal(msg.session, "ses_r");
+  assert.equal(msg.reqid, "pr_1");
+});
+
 test("messages sent while disconnected flush in order after reconnect", async () => {
   // Drop the control connection and stop listening so sendEvent queues.
   serverConn.destroy();

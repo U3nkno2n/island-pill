@@ -375,6 +375,75 @@ class TestOpenCodeBridge(unittest.TestCase):
         msg = json.loads(client.write_queue[0].decode())
         self.assertEqual(msg["decision"], "deny")
 
+    def test_closed_message_removes_session_no_peek(self):
+        """A "closed" message removes the session row and shows no peek."""
+        called = []
+        self.bridge.register_session_callback(lambda info: called.append(info))
+        client = FakeClient()
+        self._handle(client, {
+            "type": "closed",
+            "session": "s1",
+            "project": "myproj",
+            "ts": 1000.0,
+        })
+        self.assertEqual(len(self.win.peek_calls), 0)
+        self.assertEqual(len(called), 1)
+        self.assertEqual(called[0]["state"], "closed")
+        self.assertEqual(called[0]["session"], "s1")
+
+    def test_permission_replied_clears_pending(self):
+        """A "permission.replied" clears the pending permission and notifies the host."""
+        called = []
+        self.bridge.register_decision_callback(lambda info: called.append(info))
+        client = FakeClient()
+        self._handle(client, {
+            "type": "permission",
+            "session": "s1",
+            "reqid": "perm-1",
+            "project": "myproj",
+            "title": "Edit file.py",
+            "ts": 1000.0,
+        })
+        self.assertIn(("s1", "perm-1"), self.bridge.pending_permissions)
+        self._handle(client, {
+            "type": "permission.replied",
+            "session": "s1",
+            "requestID": "perm-1",
+            "permissionID": "perm-1",
+            "project": "myproj",
+            "ts": 1001.0,
+        })
+        self.assertNotIn(("s1", "perm-1"), self.bridge.pending_permissions)
+        # decision_callback was called for both register and replied
+        self.assertEqual(len(called), 2)
+        self.assertEqual(called[1]["type"], "replied")
+        self.assertEqual(called[1]["permission_id"], "perm-1")
+        # No peek from the bridge (host renders)
+        self.assertEqual(len(self.win.peek_calls), 0)
+
+    def test_permission_types_bypass_dedup(self):
+        """Two different permission reqids for the same session both notify
+        the host (not deduped because reqid is in the dedup key)."""
+        called = []
+        self.bridge.register_decision_callback(lambda info: called.append(info))
+        client = FakeClient()
+        self._handle(client, {
+            "type": "permission",
+            "session": "s1",
+            "reqid": "perm-1",
+            "ts": 1000.0,
+        })
+        self._handle(client, {
+            "type": "permission",
+            "session": "s1",
+            "reqid": "perm-2",
+            "ts": 1000.1,
+        })
+        # Both should notify the host (not deduped because reqid differs)
+        self.assertEqual(len(called), 2)
+        self.assertEqual(called[0]["permission_id"], "perm-1")
+        self.assertEqual(called[1]["permission_id"], "perm-2")
+
     def test_control_client_survives_idle_timeout(self):
         """A registered control connection must NOT be closed for being idle.
         Patch CLIENT_TIMEOUT to a tiny value, schedule a timeout, identify as
