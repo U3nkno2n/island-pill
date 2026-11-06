@@ -72,6 +72,14 @@ const sendControl = (payload) => {
 let controlSock = null;
 let controlBuffer = "";
 
+// Outbound message queue used while the control socket is down or
+// reconnecting.  Messages are flushed in order once connected.
+const sendQueue = [];
+const MAX_SEND_QUEUE = 50;
+// Logged once per outage so the debug log is not flooded with one line
+// per dropped message.
+let socketOfflineLogged = false;
+
 // Pending permission requests awaiting a decision from the island.
 // reqid -> { resolve, timer }
 const pendingPermissions = new Map();
@@ -85,9 +93,20 @@ function connectControl() {
   controlSock.unref();
   controlSock.on("connect", () => {
     debugLog("control-connect", { result: "connected" });
+    socketOfflineLogged = false;
     try {
       controlSock.write(JSON.stringify({ type: "control", agent: "opencode" }) + "\n");
     } catch {}
+    // Flush any queued messages in order once connected.
+    while (sendQueue.length) {
+      const next = sendQueue.shift();
+      try {
+        controlSock.write(next);
+      } catch {
+        controlSock = null;
+        break;
+      }
+    }
   });
   controlSock.on("data", (data) => {
     controlBuffer += data.toString();
@@ -130,12 +149,23 @@ function sendEvent(payload) {
     debugLog("socket-send", { result: "no-socket-path" });
     return;
   }
+  const line = JSON.stringify(payload) + "\n";
   if (!controlSock || controlSock.destroyed) {
+    // Queue the message and retry once connected; never silently drop.
+    if (sendQueue.length >= MAX_SEND_QUEUE) {
+      sendQueue.shift(); // drop oldest
+    }
+    sendQueue.push(line);
+    if (!socketOfflineLogged) {
+      debugLog("socket-offline", { result: "reconnecting" });
+      socketOfflineLogged = true;
+    }
     connectControl();
     return;
   }
+  socketOfflineLogged = false;
   try {
-    controlSock.write(JSON.stringify(payload) + "\n");
+    controlSock.write(line);
     debugLog("socket-send", { result: "written" });
   } catch {
     debugLog("socket-send", { result: "write-error" });
@@ -145,25 +175,32 @@ function sendEvent(payload) {
 
 // Answer an OpenCode permission request via the island pill.
 // Returns a promise that resolves to "allow", "deny", or "ask" (fallback).
-function permissionAsk(input) {
-  return new Promise((resolve) => {
-    const reqid = input.id || "";
-    const session = input.sessionID || "";
-    sendEvent({
-      type: "permission",
-      session: session,
-      reqid: reqid,
-      project: projectName,
-      title: input.title,
-      detail: input.type + (input.pattern ? ": " + input.pattern : ""),
-      ts: Date.now(),
-    });
-    const timer = setTimeout(() => {
-      pendingPermissions.delete(reqid);
-      resolve("ask");
-    }, PERMISSION_TIMEOUT_MS);
-    pendingPermissions.set(reqid, { resolve, timer });
+// The permission.ask hook and the permission.asked event carry the same
+// reqid, so the second caller reuses the first caller's pending entry
+// instead of sending a second message.
+function permissionAsk(input, projectName) {
+  const reqid = input && input.id ? String(input.id) : "";
+  const session = input && input.sessionID ? String(input.sessionID) : "";
+  if (reqid && pendingPermissions.has(reqid)) {
+    return pendingPermissions.get(reqid).promise;
+  }
+  let resolveFn;
+  const promise = new Promise((resolve) => { resolveFn = resolve; });
+  sendEvent({
+    type: "permission",
+    session: session,
+    reqid: reqid,
+    project: projectName,
+    title: input.title,
+    detail: input.type + (input.pattern ? ": " + input.pattern : ""),
+    ts: Date.now(),
   });
+  const timer = setTimeout(() => {
+    pendingPermissions.delete(reqid);
+    resolveFn("ask");
+  }, PERMISSION_TIMEOUT_MS);
+  pendingPermissions.set(reqid, { resolve: resolveFn, timer, promise });
+  return promise;
 }
 
 // Establish the control connection on module load.
@@ -171,14 +208,16 @@ connectControl();
 
 // OpenCode 1.19.5 plugin entry point. Receives PluginInput and returns Hooks.
 export const server = async ({ project, client, directory, worktree }) => {
-  const projectName =
+  const baseName = (p) =>
+    p ? (String(p).split("/").filter(Boolean).pop() || "") : "";
+  let projectName =
     (typeof project === "object" && project && project.name)
       ? String(project.name)
-      : worktree
-        ? worktree.split("/").pop()
-        : directory
-          ? directory.split("/").pop()
-          : process.cwd().split("/").pop() || "";
+      : "";
+  if (!projectName) projectName = baseName(worktree);
+  if (!projectName) projectName = baseName(directory);
+  if (!projectName) projectName = baseName(process.cwd());
+  if (!projectName) projectName = "OpenCode";
 
   debugLog("server-called", {
     project: typeof project === "object" && project ? project.id : "",
@@ -291,19 +330,43 @@ export const server = async ({ project, client, directory, worktree }) => {
         };
         debugLog("notify-called", { ntype: "opencode-alert", sessionID, requestID });
         // Ask the island pill for a decision; await it before replying to OpenCode.
-        permissionAsk(permission).then((status) => {
+        permissionAsk(permission, projectName).then(async (status) => {
           const s = pending.get(sessionID);
           if (s) {
             s.delete(requestID);
             if (s.size === 0) pending.delete(sessionID);
           }
           debugLog("permission-decided", { requestID, status });
-        }).catch(() => {
+          // The permission.ask hook answers via output.status; also reply
+          // through the SDK here in case the hook is never invoked, so an
+          // island decision still counts.  Answering twice or against an
+          // already-processed permission must not break anything, so errors
+          // are logged and swallowed.
+          if (status === "allow" || status === "deny") {
+            const response = status === "allow" ? "once" : "reject";
+            try {
+              await client.postSessionIdPermissionsPermissionId({
+                path: { id: sessionID, permissionID: requestID },
+                body: { response: response },
+              });
+              debugLog("permission-reply-ok", { requestID, response: response });
+            } catch (e) {
+              debugLog("permission-reply-error", {
+                requestID,
+                error: e && e.message ? e.message : String(e),
+              });
+            }
+          }
+        }).catch((e) => {
           const s = pending.get(sessionID);
           if (s) {
             s.delete(requestID);
             if (s.size === 0) pending.delete(sessionID);
           }
+          debugLog("permission-event-error", {
+            requestID,
+            error: e && e.message ? e.message : String(e),
+          });
         });
         return;
       }
@@ -459,8 +522,11 @@ export const server = async ({ project, client, directory, worktree }) => {
       // request times out, fall back to "ask" so OpenCode uses its normal
       // terminal prompt.
       try {
-        output.status = await permissionAsk(input);
-      } catch {
+        output.status = await permissionAsk(input, projectName);
+      } catch (e) {
+        debugLog("permission-hook-error", {
+          error: e && e.message ? e.message : String(e),
+        });
         output.status = "ask";
       }
     },

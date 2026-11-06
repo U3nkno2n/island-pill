@@ -61,6 +61,10 @@ from island.settings import (  # noqa: E402
     TIMER_PRESETS,
 )
 # -----------------------------------------------------------------------------
+# How long a permission peek (Allow / Deny) stays on screen when nobody
+# answers it.  Used wherever the permission peek duration is set.
+PERMISSION_PEEK_SECONDS = 30
+
 # Pure peek helpers moved verbatim to island/peek.py (Stage 2); the host
 # keeps all peek state and timers.
 from island.peek import (  # noqa: E402
@@ -87,7 +91,7 @@ ROW_DL_H = HOME_GAP + DL_CARD_H  # download row growth on Home (only while downl
 STATS_CARD_H = 44                # stats card on System (CPU / RAM / TEMP / battery)
 TIMER_CARD_H = 44                # timer card on System (timer chips or countdown)
 SYSTEM_CONTENT_H = STATS_CARD_H + HOME_GAP + TIMER_CARD_H + HOME_PAD_B   # cards + gap + padding
-OPENCODE_CONTENT_H = 84          # "No sessions yet" card below the tab row
+OPENCODE_CONTENT_H = 132         # six live session rows in one card
 OPEN_H_MAX = OPEN_H_BASE + ROW_CONN_H + ROW_DL_H
 OPEN_MIN_H = min(OPEN_H_BASE,
                  TAB_ROW_H + SYSTEM_CONTENT_H,
@@ -102,6 +106,13 @@ DONE_MIN_BYTES = 20 * 1048576    # smaller downloads finish without a "finished"
 
 from island.theme import BLUE, DIM, FAINT, GREEN, ORANGE, WHITE  # noqa: E402
 BLACK = (0, 0, 0, 1) if NOTCH else (0.02, 0.02, 0.02, 1)
+
+# Live session rows on the OpenCode tab (display-only; state comes from events).
+OC_STALE_AFTER = 600.0            # seconds a "working" row may go quiet before it paints as "Idle"
+OC_ROW_ORDER = {"approval": 0, "working": 1, "done": 2, "failed": 2}
+OC_ROW_TEXT = {"working": "Working", "approval": "Approval",
+               "done": "Done", "failed": "Failed"}
+OC_ROW_COLOR = {"working": BLUE, "approval": ORANGE, "done": GREEN, "failed": ORANGE}
 
 # MPRIS identifiers and the media/alarm machinery moved verbatim to
 # island/audio.py (Stage 2); these names stay for compatibility.
@@ -121,7 +132,7 @@ from island.rendering import (  # noqa: E402
     rounded_rect, shape_path, _layout, measure, draw_text, glyph_tri,
     glyph_skip, glyph_pause, draw_bars, draw_battery, draw_clock_icon,
     draw_bt_glyph, draw_wifi_glyph, draw_down_arrow, progress_bar,
-    indeterminate_bar, tab_pill, card, CARD,
+    indeterminate_bar, tab_pill, card, state_dot, CARD,
 )
 
 
@@ -344,6 +355,7 @@ class Island(Gtk.Window):
             self.init_downloads()
 
         # ---- OpenCode bridge (guarded; no-op if module is absent) ----
+        self.oc_sessions = {}   # session id -> {"project", "state", "ts"} live rows
         self._oc_bridge = None
         try:
             from island_pill_opencode_bridge import attach_opencode_bridge
@@ -355,6 +367,7 @@ class Island(Gtk.Window):
                 if self._oc_bridge:
                     self._oc_bridge.register_decision_callback(
                         self._on_opencode_permission_register)
+                    self._oc_bridge.register_session_callback(self.oc_sessions_update)
             except Exception:
                 self._oc_bridge = None
 
@@ -520,14 +533,16 @@ class Island(Gtk.Window):
         if secs is None:
             secs = PEEK_SECONDS        # read at call time: hand-edit friendly
         if self.open:
-            # The expanded card is showing: queue the event so it can surface
-            # when the card closes instead of being silently discarded.
+            # The expanded card is showing: close it and show the peek
+            # instead of queueing the event for later.
             self.pending_peek = peek_queue_payload(kind, title, body, secs, accent, app)
+            self.set_open(False)
             return
         if not should_show_peek(self.open, HOVER_ONLY_PEEKS):
             return
         self.peek = dict(kind=kind, title=title, body=body, accent=accent, app=app)
         self.peek_on = True
+        self.peek_deadline = time.monotonic() + secs
         self._cancel("peek")
         self._ids["peek"] = once(int(secs * 1000), self._peek_timeout)
         self.retarget()
@@ -553,8 +568,12 @@ class Island(Gtk.Window):
         self.retarget()
         if self.media_playing() or self.batt_state in (1, 5) or self.dl_active:
             self.ensure_visual_tick()
-        if not self.open and not self._ids["open"]:
-            self._ids["open"] = once(HOVER_OPEN_DELAY_MS, self._do_open)
+        # Hover reveals the pill only: the full card opens on pill click,
+        # never on hover.  While a peek is on screen the hover must not
+        # disturb it, so drop its dismiss timer - the pointer over the peek
+        # keeps the peek alive until it is answered or times out.
+        if self.peek_on:
+            self._cancel("peek")
         self.queue_draw()
         return False
 
@@ -562,6 +581,18 @@ class Island(Gtk.Window):
         self._cancel("open")
         if self.open and not self._ids["close"]:
             self._ids["close"] = once(CLOSE_HYSTERESIS_MS, self._do_close)
+        elif self.peek_on:
+            # Pointer left the window: re-arm the peek dismiss timer with
+            # the remaining time so the peek still auto-dismisses after its
+            # timeout (permission peek: PERMISSION_PEEK_SECONDS).
+            remaining = int(
+                (getattr(self, "peek_deadline", time.monotonic()) - time.monotonic())
+                * 1000
+            )
+            if remaining > 0:
+                self._ids["peek"] = once(remaining, self._peek_timeout)
+            else:
+                self.end_peek()
         elif not self.open:
             self.pointer_inside = False
             self.retarget()
@@ -1108,7 +1139,7 @@ class Island(Gtk.Window):
             "opencode-alert",
             "OpenCode · %s" % info.get("project", ""),
             info.get("title", "") + ("\n" + info.get("detail", "") if info.get("detail") else ""),
-            secs=None,
+            secs=PERMISSION_PEEK_SECONDS,
             accent=ORANGE,
             app="OC",
         )
@@ -1605,12 +1636,64 @@ class Island(Gtk.Window):
         if self.dl_active:
             self.draw_download(cr, left, right, y + HOME_GAP)
 
+    # ---- live OpenCode sessions (OpenCode tab)
+    def oc_sessions_update(self, info):
+        """Merge one bridge session event into the live row table.  Returns
+        False so the GLib.idle_add that invokes it never repeats."""
+        self.oc_sessions[info["session"]] = {
+            "project": info["project"], "state": info["state"], "ts": info["ts"],
+        }
+        self._oc_sessions_prune()
+        if self.open_tab == "OpenCode":
+            self.queue_draw()
+        return False
+
+    def _oc_sessions_prune(self):
+        """Keep at most 6 rows: drop finished ones first, then the oldest."""
+        sessions = self.oc_sessions
+        while len(sessions) > 6:
+            finished = [k for k, v in sessions.items()
+                        if v["state"] in ("done", "failed")]
+            if finished:
+                del sessions[min(finished, key=lambda k: sessions[k]["ts"])]
+            else:
+                del sessions[min(sessions, key=lambda k: sessions[k]["ts"])]
+
+    def _oc_session_rows(self):
+        """Rows in draw order: approval, then working, then done/failed,
+        newest first within each group."""
+        return sorted(
+            self.oc_sessions.items(),
+            key=lambda kv: (OC_ROW_ORDER.get(kv[1]["state"], 3), -kv[1]["ts"]),
+        )
+
     def _draw_opencode(self, cr, oy, left, right):
-        # one card, centred text, until real session rows land here
-        ch = OPENCODE_CONTENT_H - 24
-        card(cr, left, oy + 12, right - left, ch)
-        draw_text(cr, "No sessions yet", left + (right - left) / 2.0,
-                  oy + 12 + ch / 2.0, 11, DIM, align=1)
+        # one card, one row per live session: state dot, project name, state
+        w = right - left
+        card(cr, left, oy + 12, w, OPENCODE_CONTENT_H - 24)
+        rows = self._oc_session_rows()[:6]
+        if not rows:
+            draw_text(cr, "No sessions yet", left + w / 2.0,
+                      oy + 12 + (OPENCODE_CONTENT_H - 24) / 2.0, 11, DIM,
+                      align=1)
+            return
+        now = time.monotonic()
+        cx = left + HOME_CARD_PAD + 4
+        name_x = left + HOME_CARD_PAD + 12
+        for i, (_sid, row) in enumerate(rows):
+            cy = oy + 21 + 18 * i
+            state = row["state"]
+            if state == "working" and now - row["ts"] > OC_STALE_AFTER:
+                col, txt = FAINT, "Idle"
+            else:
+                col = OC_ROW_COLOR.get(state, BLUE)
+                txt = OC_ROW_TEXT.get(state, "Working")
+            state_dot(cr, cx, cy, 3.5, col)
+            sw = measure(txt, 9)
+            draw_text(cr, row["project"] or "OpenCode", name_x, cy, 9.5, WHITE,
+                      bold=True, width=max(30, right - HOME_CARD_PAD - name_x
+                                           - sw - 10))
+            draw_text(cr, txt, right - HOME_CARD_PAD, cy, 9, DIM, align=2)
 
     def _draw_system(self, cr, oy, left, right, cur):
         # stats card: CPU, RAM, TEMP and battery cells in one row

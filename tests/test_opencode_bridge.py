@@ -49,6 +49,7 @@ class FakeClient:
         self.active = True
         self.write_queue = []
         self.write_watch_id = 0
+        self.timeout_id = 0
         self.is_control = False
         # Real socketpair so GLib can watch fileno() for ACK writes.
         self._read_fd, self._write_fd = socket.socketpair()
@@ -214,6 +215,33 @@ class TestOpenCodeBridge(unittest.TestCase):
         self.assertEqual(len(self.win.peek_calls), 2)
         self.assertEqual(self.win.peek_calls[1][0], "opencode")
 
+    # ------------------------------------------------- session state table -
+
+    def test_session_callback_state_mapping(self):
+        infos = []
+        self.bridge.register_session_callback(lambda info: infos.append(info))
+        client = FakeClient()
+        for etype, state in (("started", "working"), ("working", "working"),
+                             ("permission", "approval"), ("done", "done"),
+                             ("failed", "failed"), ("cancelled", "failed")):
+            self._handle(client, {
+                "type": etype, "session": "s1", "project": "proj", "ts": 1000.0,
+            })
+        self.assertEqual([(i["state"], i["session"], i["project"]) for i in infos],
+                         [("working", "s1", "proj"), ("working", "s1", "proj"),
+                          ("approval", "s1", "proj"), ("done", "s1", "proj"),
+                          ("failed", "s1", "proj"), ("failed", "s1", "proj")])
+
+    def test_session_callback_fires_when_peek_deduped(self):
+        """The session callbacks fire even when the peek is dedup-suppressed."""
+        infos = []
+        self.bridge.register_session_callback(lambda info: infos.append(info))
+        client = FakeClient()
+        self._handle(client, {"type": "done", "session": "s1", "ts": 1000.0})
+        self._handle(client, {"type": "done", "session": "s1", "ts": 1000.1})
+        self.assertEqual(len(self.win.peek_calls), 1)   # peek deduped
+        self.assertEqual(len(infos), 2)                 # state still updated
+
     # ------------------------------------------------- control connection --
 
     def test_control_identify(self):
@@ -346,6 +374,63 @@ class TestOpenCodeBridge(unittest.TestCase):
         self.assertTrue(ok)
         msg = json.loads(client.write_queue[0].decode())
         self.assertEqual(msg["decision"], "deny")
+
+    def test_control_client_survives_idle_timeout(self):
+        """A registered control connection must NOT be closed for being idle.
+        Patch CLIENT_TIMEOUT to a tiny value, schedule a timeout, identify as
+        control (which cancels the timeout), then verify the client is still
+        open and a decision still reaches it afterwards."""
+        old_ttl = island_pill_opencode_bridge.CLIENT_TIMEOUT
+        island_pill_opencode_bridge.CLIENT_TIMEOUT = 0.01  # 10 ms
+        try:
+            client = FakeClient()
+            # Manually schedule the idle timeout (normally done by
+            # _on_listen_readable when a real socket connects).
+            client.timeout_id = GLib.timeout_add_seconds(
+                0.01, self.bridge._client_timeout, client,
+            )
+            # Identify as control -> the timeout is cancelled.
+            self._handle(client, {
+                "type": "control", "agent": "opencode",
+            })
+            self.assertEqual(client.timeout_id, 0, "control client timeout was not cancelled")
+            self.assertIs(self.bridge.control_client, client)
+            self.assertTrue(client.active)
+            # A decision still reaches the plugin afterwards.
+            self.bridge.pending_permissions[("s1", "perm-1")] = {
+                "project": "myproj", "title": "Edit", "detail": "bash",
+            }
+            ok = self.bridge.host_decision("perm-1", "allow")
+            self.assertTrue(ok)
+            self.assertEqual(len(client.write_queue), 1)
+            msg = json.loads(client.write_queue[0].decode())
+            self.assertEqual(msg["type"], "opencode.decision")
+            self.assertEqual(msg["decision"], "allow")
+        finally:
+            island_pill_opencode_bridge.CLIENT_TIMEOUT = old_ttl
+
+    def test_non_control_client_closes_on_idle_timeout(self):
+        """Sanity check: a connection that never identifies as control IS
+        closed by the idle timeout (the timeout still exists for non-control)."""
+        old_ttl = island_pill_opencode_bridge.CLIENT_TIMEOUT
+        island_pill_opencode_bridge.CLIENT_TIMEOUT = 0.01
+        try:
+            client = FakeClient()
+            # Manually schedule the idle timeout (normally done by
+            # _on_listen_readable when a real socket connects).
+            client.timeout_id = GLib.timeout_add_seconds(
+                0.01, self.bridge._client_timeout, client,
+            )
+            # Send a non-control message; client never identifies as control.
+            self._handle(client, {
+                "type": "working", "session": "s1", "ts": 1000.0,
+            })
+            # Directly invoke the timeout callback (deterministic, no real-time sleep).
+            self.bridge._client_timeout(client)
+            self.assertFalse(client.active, "non-control client should be closed by idle timeout")
+            self.assertIsNone(self.bridge.control_client)
+        finally:
+            island_pill_opencode_bridge.CLIENT_TIMEOUT = old_ttl
 
     # ------------------------------------------------- dedup --------------
 

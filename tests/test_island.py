@@ -212,9 +212,9 @@ class TestShowPeekHoverOnly(unittest.TestCase):
             self._restore_timeouts()
         self.assertTrue(self.win.peek_on)
 
-    def test_show_peek_while_open_queues_pending(self):
-        """An event fired while the expanded card is open is queued as a
-        pending peek instead of being silently discarded."""
+    def test_show_peek_while_open_closes_card_shows_peek(self):
+        """An event fired while the expanded card is open closes the card
+        and shows the peek immediately instead of queueing it."""
         island_pill.HOVER_ONLY = True
         island_pill.HOVER_ONLY_PEEKS = True
         self.win.open = True
@@ -223,9 +223,11 @@ class TestShowPeekHoverOnly(unittest.TestCase):
             self.win.show_peek("timer", "Time's up", "5 min timer finished", secs=10)
         finally:
             self._restore_timeouts()
-        self.assertFalse(self.win.peek_on)      # not shown immediately
-        self.assertIsNotNone(self.win.pending_peek)
-        self.assertEqual(self.win.pending_peek["kind"], "timer")
+        self.assertFalse(self.win.open)          # card closed
+        self.assertTrue(self.win.peek_on)        # peek shown immediately
+        self.assertEqual(self.win.peek["kind"], "timer")
+        self.assertEqual(self.win.peek["title"], "Time's up")
+        self.assertIsNone(self.win.pending_peek)
 
 
 class TestPendingPeekPromotion(unittest.TestCase):
@@ -525,8 +527,9 @@ class TestOpenCodePermissionHandling(unittest.TestCase):
         self.win._cancel = lambda key: None
         self.win._oc_bridge = None
 
-    def test_permission_register_shows_peek_no_autodismiss(self):
-        """Registering a permission shows a peek with secs=None (no auto-dismiss)."""
+    def test_permission_register_shows_peek_30_seconds(self):
+        """Registering a permission shows a peek that stays for
+        PERMISSION_PEEK_SECONDS (30 s) unless answered first."""
         bridge_calls = []
         self.win._oc_bridge = type("B", (), {
             "host_decision": lambda self_, pid, decision: bridge_calls.append((pid, decision))
@@ -541,7 +544,6 @@ class TestOpenCodePermissionHandling(unittest.TestCase):
             "detail": "bash: rm -rf /",
         }
 
-        # Capture show_peek calls
         peek_calls = []
         orig_show_peek = self.win.show_peek
         self.win.show_peek = lambda kind, title, body="", secs=None, accent=None, app="": \
@@ -557,9 +559,11 @@ class TestOpenCodePermissionHandling(unittest.TestCase):
         # Permission registered
         self.assertIn("perm-1", self.win.pending_permissions)
         self.assertEqual(self.win.pending_permissions["perm-1"]["title"], "Edit file.py")
-        # Peek shown with secs=None (no auto-dismiss)
+        # Peek shown with the 30 s permission duration, not the old 12 s alert.
         self.assertEqual(len(peek_calls), 1)
-        self.assertIsNone(peek_calls[0][3])  # secs is None
+        self.assertEqual(peek_calls[0][3], island_pill.PERMISSION_PEEK_SECONDS)
+        self.assertEqual(peek_calls[0][3], 30)
+        self.assertGreater(island_pill.PERMISSION_PEEK_SECONDS, 12)
 
     def test_opencode_decision_allow_forwards_to_bridge(self):
         """Clicking Allow forwards the decision to the bridge and shows confirmation."""
@@ -629,6 +633,161 @@ class TestOpenCodePermissionHandling(unittest.TestCase):
         self.assertNotIn("perm-3", self.win.pending_permissions)
 
 
+class TestClickExpandAndPeeks(unittest.TestCase):
+    """Hover reveals the pill only; the card opens on pill click.
+    Permission peeks stay until Allow/Deny is clicked or
+    PERMISSION_PEEK_SECONDS elapses."""
+
+    def setUp(self):
+        self.win = island_pill.Island.__new__(island_pill.Island)
+        self.win.open = False
+        self.win.pointer_inside = False
+        self.win.peek_on = False
+        self.win.peek = {}
+        self.win.pending_peek = None
+        self.win.pending_permissions = {}
+        self.win._ids = {"open": 0, "close": 0, "peek": 0, "sec": 0}
+        self.win.dl_dir = island_pill.download_dir()
+        self.win.retarget = lambda: None
+        self.win.queue_draw = lambda: None
+        self.win.get_mapped = lambda: False
+        self.win._oc_bridge = None
+        self.win.activity_visible = lambda: False
+        self.win.media_playing = lambda: False
+        self.win.batt_state = 0
+        self.win.dl_active = False
+        self.win.idle_target_w = lambda: 120
+        self.win.idle_target_h = lambda: 34
+        self.win.open_tab = "Home"
+        self.win.hits = []
+        self._capture_timeouts()
+
+    def tearDown(self):
+        self._restore_timeouts()
+
+    def _capture_timeouts(self):
+        """Replace GLib timers so no real timers run in the test process."""
+        self.timeouts = []
+        self.orig_add = GLib.timeout_add
+        self.orig_add_seconds = GLib.timeout_add_seconds
+
+        def capture(ms, fn):
+            self.timeouts.append(ms)
+            return 999
+
+        def capture_seconds(s, fn):
+            self.timeouts.append(s * 1000)
+            return 999
+
+        GLib.timeout_add = capture
+        GLib.timeout_add_seconds = capture_seconds
+
+    def _restore_timeouts(self):
+        GLib.timeout_add = self.orig_add
+        GLib.timeout_add_seconds = self.orig_add_seconds
+
+    def test_hover_reveals_pill_only(self):
+        island_pill.HOVER_ONLY = True
+        self.win.on_enter(None, None)
+        # Hover reveals the pill; the full card never opens on hover.
+        self.assertFalse(self.win.open)
+        self.assertEqual(self.win.target(), (120, 34))
+        # Moving the pointer away retracts to hidden.
+        self.win.on_leave(None, None)
+        self.assertEqual(self.win.target(), (1, 1))
+
+    def test_click_pill_opens_card_second_click_closes(self):
+        island_pill.HOVER_ONLY = True
+        ev = type("Ev", (), {"button": 1})()
+        self.win.on_press(None, ev)
+        self.assertTrue(self.win.open)          # first click opens the card
+        self.win.hits = []                      # nothing under the cursor
+        self.win.on_press(None, ev)
+        self.assertFalse(self.win.open)         # second click closes it
+        self.assertFalse(self.win.peek_on)
+
+    def test_pointer_away_schedules_retract(self):
+        island_pill.HOVER_ONLY = True
+        self.win.open = True
+        self.win.pointer_inside = True
+        self.win.on_leave(None, None)
+        self.assertTrue(self.win._ids["close"]) # retract after the delay
+
+    def test_hover_over_permission_peek_never_opens_card(self):
+        island_pill.HOVER_ONLY = True
+        self.win.peek_on = True
+        self.win.peek = {
+            "kind": "opencode-alert",
+            "title": "OpenCode · myproj",
+            "body": "Edit file.py\nbash: rm -rf /",
+            "permission_id": "perm-1",
+            "accent": island_pill.ORANGE,
+            "app": "OC",
+        }
+        self.win.pending_permissions = {
+            "perm-1": {"session": "s1", "project": "myproj",
+                       "title": "Edit file.py", "detail": "bash: rm -rf /"}
+        }
+        self.win.on_enter(None, None)
+        # Hovering a permission peek never opens the full card.
+        self.assertFalse(self.win.open)
+        self.assertEqual(self.win.target(), (island_pill.PEEK_W, island_pill.PEEK_H))
+        # The pointer over the peek keeps it alive.
+        self.assertTrue(self.win.peek_on)
+
+    def test_permission_peek_targets_reachable_while_hovering(self):
+        island_pill.HOVER_ONLY = True
+        self.win.pointer_inside = True
+        self.win.peek_on = True
+        self.win.peek = {
+            "kind": "opencode-alert",
+            "title": "OpenCode · myproj",
+            "body": "Edit file.py",
+            "permission_id": "perm-1",
+            "accent": island_pill.ORANGE,
+            "app": "OC",
+        }
+        self.win.pending_permissions = {
+            "perm-1": {"session": "s1", "project": "myproj",
+                       "title": "Edit file.py", "detail": "bash"}
+        }
+        bridge_calls = []
+        self.win._oc_bridge = type("B", (), {
+            "host_decision": lambda self_, pid, decision: bridge_calls.append((pid, decision))
+        })()
+
+        surf = cairo.ImageSurface(cairo.FORMAT_ARGB32,
+                                  island_pill.WIN_W, island_pill.WIN_H)
+        cr = cairo.Context(surf)
+        self.win.draw_peek(cr)
+        # Allow and Deny hit targets exist while the pointer is over the peek.
+        self.assertEqual(len(self.win.hits), 2)
+        self.win.hits[0][4]()                       # click Allow
+        self.assertEqual(bridge_calls, [("perm-1", "allow")])
+        self.assertNotIn("perm-1", self.win.pending_permissions)
+        self.assertTrue(self.win.peek_on)           # confirmation peek is showing
+
+    def test_permission_peek_outlives_old_alert_seconds(self):
+        island_pill.HOVER_ONLY = True
+        island_pill.HOVER_ONLY_PEEKS = True
+        self.win.show_peek("opencode-alert", "OpenCode · myproj",
+                           "Edit file.py",
+                           secs=island_pill.PERMISSION_PEEK_SECONDS,
+                           accent=island_pill.ORANGE, app="OC")
+        self.assertTrue(self.win.peek_on)
+        # The permission peek uses the 30 s constant, beyond the old 12 s.
+        self.assertEqual(island_pill.PERMISSION_PEEK_SECONDS, 30)
+        self.assertGreater(island_pill.PERMISSION_PEEK_SECONDS, 12)
+        self.assertIn(30 * 1000, self.timeouts)
+
+    def test_non_permission_peek_click_ends_peek(self):
+        """A click on a non-permission peek behaves as today: it ends the peek."""
+        self.win.peek_on = True
+        self.win.peek = {"kind": "notify", "title": "Hi"}
+        self.win.on_press(None, type("Ev", (), {"button": 1})())
+        self.assertFalse(self.win.peek_on)
+
+
 class TestOpenTabsHeadless(unittest.TestCase):
     """Headless draw_open for each tab value on a cairo ImageSurface."""
 
@@ -636,6 +795,7 @@ class TestOpenTabsHeadless(unittest.TestCase):
         self.win = island_pill.Island.__new__(island_pill.Island)
         self.win.open_tab = "Home"
         self.win.hits = []
+        self.win.oc_sessions = {}
         self.win.current_player = lambda: None
         self.win.cpu_pct = None
         self.win.mem_used = None
@@ -794,6 +954,132 @@ class TestOpenSystemStatesHeadless(unittest.TestCase):
     def test_system_timer_done(self):
         self.win.timer_end = time.monotonic() - 60.0
         self._draw()
+
+
+class TestOpenSessionsHeadless(unittest.TestCase):
+    """Headless OpenCode tab draws over the live session rows: sizes, states,
+    ordering, long names, the draw-time staleness rule and the prune logic."""
+
+    def setUp(self):
+        self.win = island_pill.Island.__new__(island_pill.Island)
+        self.win.open_tab = "OpenCode"
+        self.win.hits = []
+        self.win.oc_sessions = {}
+        self.win.current_player = lambda: None
+        self.win.queue_draw = lambda: None
+
+    def _draw(self):
+        surf = cairo.ImageSurface(cairo.FORMAT_ARGB32,
+                                  island_pill.WIN_W, island_pill.WIN_H)
+        cr = cairo.Context(surf)
+        self.win.draw_open(cr)
+
+    def _draw_collect(self):
+        """draw_open with the island-side drawing helpers recorded, so dot
+        colours and drawn row texts can be asserted."""
+        surf = cairo.ImageSurface(cairo.FORMAT_ARGB32,
+                                  island_pill.WIN_W, island_pill.WIN_H)
+        cr = cairo.Context(surf)
+        dots, texts = [], []
+        orig_dot, orig_text = island_pill.state_dot, island_pill.draw_text
+        island_pill.state_dot = lambda cr, cx, cy, r, color: dots.append((cx, cy, color))
+
+        def text_stub(cr, s, x, cy, size, color, bold=False, width=None, align=0):
+            texts.append((s, color))
+        island_pill.draw_text = text_stub
+        try:
+            self.win.draw_open(cr)
+        finally:
+            island_pill.state_dot = orig_dot
+            island_pill.draw_text = orig_text
+        return dots, texts
+
+    def test_draw_zero_sessions(self):
+        self._draw()   # "No sessions yet" line
+
+    def test_draw_one_session(self):
+        self.win.oc_sessions["s1"] = {
+            "project": "proj", "state": "working", "ts": time.monotonic(),
+        }
+        self._draw()
+
+    def test_draw_six_sessions_all_states(self):
+        now = time.monotonic()
+        self.win.oc_sessions = {
+            "a1": {"project": "preset", "state": "approval", "ts": now - 1},
+            "a2": {"project": "deploy", "state": "approval", "ts": now - 2},
+            "w1": {"project": "alpha", "state": "working", "ts": now - 3},
+            "w2": {"project": "beta", "state": "working", "ts": now - 4},
+            "d1": {"project": "gamma", "state": "done", "ts": now - 5},
+            "f1": {"project": "delta", "state": "failed", "ts": now - 6},
+        }
+        self._draw()
+
+    def test_draw_eight_sessions(self):
+        now = time.monotonic()
+        states = ("approval", "working", "done", "failed")
+        self.win.oc_sessions = {
+            "s%d" % i: {"project": "session project %d" % i,
+                        "state": states[i % 4], "ts": now - i}
+            for i in range(8)
+        }
+        self._draw()
+
+    def test_draw_long_names(self):
+        self.win.oc_sessions["s1"] = {
+            "project": "opencode-project-with-a-hundred-character-name-that-must"
+                       "-ellipsize-under-the-state-column-without-raising",
+            "state": "working", "ts": time.monotonic(),
+        }
+        self._draw()
+
+    def test_row_order(self):
+        """approval first, then working, then done/failed; newest first within."""
+        now = time.monotonic()
+        self.win.oc_sessions = {
+            "w1": {"project": "a", "state": "working", "ts": now - 10},
+            "a1": {"project": "b", "state": "approval", "ts": now - 20},
+            "d1": {"project": "c", "state": "done", "ts": now - 5},
+            "w2": {"project": "d", "state": "working", "ts": now - 2},
+            "f1": {"project": "e", "state": "failed", "ts": now - 1},
+        }
+        self.assertEqual([k for k, _ in self.win._oc_session_rows()],
+                         ["a1", "w2", "w1", "f1", "d1"])
+
+    def test_prune_drops_done_first_then_oldest(self):
+        """8 events -> <=6 rows; a done row is dropped before the oldest row."""
+        for i in range(5):
+            self.win.oc_sessions_update({"session": "w%d" % i, "project": "p",
+                                         "state": "working", "ts": float(i) + 1.0})
+        self.win.oc_sessions_update({"session": "done1", "project": "p",
+                                     "state": "done", "ts": 0.5})
+        self.assertEqual(len(self.win.oc_sessions), 6)
+        # 7th insert: the finished row (oldest of its group) goes first
+        self.win.oc_sessions_update({"session": "w9", "project": "p",
+                                     "state": "working", "ts": 100.0})
+        self.assertEqual(len(self.win.oc_sessions), 6)
+        self.assertNotIn("done1", self.win.oc_sessions)
+        # 8th insert: no finishers left -> the oldest overall row goes
+        self.win.oc_sessions_update({"session": "w10", "project": "p",
+                                     "state": "working", "ts": 101.0})
+        self.assertEqual(len(self.win.oc_sessions), 6)
+        self.assertNotIn("w0", self.win.oc_sessions)   # ts 1.0 = oldest working
+
+    def test_update_returns_false(self):
+        """The idle_add-registered callback must return False (never repeat)."""
+        ret = self.win.oc_sessions_update({"session": "s1", "project": "p",
+                                           "state": "working", "ts": 1.0})
+        self.assertFalse(ret)
+
+    def test_stale_working_draws_idle_with_dim_dot(self):
+        """A working row older than OC_STALE_AFTER paints dim 'Idle'."""
+        self.win.oc_sessions["s1"] = {
+            "project": "proj", "state": "working",
+            "ts": time.monotonic() - island_pill.OC_STALE_AFTER - 1.0,
+        }
+        dots, texts = self._draw_collect()
+        self.assertIn("Idle", [s for s, _color in texts])
+        self.assertTrue(any(color == (1, 1, 1, 0.12) for _x, _y, color in dots))
 
 
 class TestOpenHeightMax(unittest.TestCase):
