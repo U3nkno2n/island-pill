@@ -26,6 +26,11 @@ signals. The only wake-ups while idle are the clock (once a minute) and a tiny r
 Animation frames only run while the pill is actually moving.
 
 Right-click the pill for the Quit menu.
+
+The original capsule mascot (island/mascot.py) rides along at the left of the
+compact pill, peeks and the open card's tab row, showing the island's mood:
+OpenCode permission asks, fresh results, active work, sleep after 5 quiet
+minutes.
 """
 import fcntl
 import math
@@ -105,6 +110,7 @@ DONE_MIN_BYTES = 20 * 1048576    # smaller downloads finish without a "finished"
 # island/sysinfo.py (Stage 2.1).
 
 from island.theme import BLUE, DIM, FAINT, GREEN, ORANGE, WHITE  # noqa: E402
+from island.mascot import LOOK_LIMIT, clamp_eye, draw_mascot  # noqa: E402
 BLACK = (0, 0, 0, 1) if NOTCH else (0.02, 0.02, 0.02, 1)
 
 # Live session rows on the OpenCode tab (display-only; state comes from events).
@@ -115,6 +121,17 @@ OC_ROW_ORDER = {"approval": 0, "working": 1, "done": 2, "failed": 2}
 OC_ROW_TEXT = {"working": "Working", "approval": "Approval",
                "done": "Done", "failed": "Failed"}
 OC_ROW_COLOR = {"working": BLUE, "approval": ORANGE, "done": GREEN, "failed": ORANGE}
+
+# Original capsule mascot (island/mascot.py): one size for each of the three
+# places it appears, the compact-pill width segment it needs, and the mood
+# timing table (no timers: the mood is recomputed at draw time).
+MASCOT_IDLE_SIZE = 22              # compact pill, left of the clock / activity text
+MASCOT_PEEK_SIZE = 26              # peeks, left of the peek text
+MASCOT_CARD_SIZE = 24              # open card, left end of the tab row
+MASCOT_IDLE_W = 34                 # compact pill: mascot plus breathing room
+OC_MOOD_FAILED_S = 10.0            # a Failed row keeps the failed mood this long
+OC_MOOD_DONE_S = 4.0               # a Done row keeps the done mood this long
+MASCOT_SLEEP_AFTER = 300.0         # this much quiet puts the mascot to sleep
 
 # MPRIS identifiers and the media/alarm machinery moved verbatim to
 # island/audio.py (Stage 2); these names stay for compatibility.
@@ -208,6 +225,62 @@ def clock_text():
     return _clock_text(HOUR24)
 
 
+def idle_layout(kind, label, charging, timer_on, h24):
+    """Content-row slots of the compact pill for one state.
+
+    Pure state -> geometry: returns {"width": pill px needed,
+    "<element>": (x0, x1)} with x relative to the pill's left edge and
+    ranges left-inclusive / right-exclusive.  Elements: mascot (always,
+    at the far left); icon (music bars or download arrow) plus text while
+    music plays or a download runs (a download wins over music); battery
+    alone for the charger flash (old position: centred); clock/timer text
+    otherwise.  idle_w sizes the pill from "width" and draw_idle
+    positions from the ranges, so the pill and its content cannot
+    disagree.  The download progress strip paints along the bottom edge
+    (below this row) exactly as before.
+    """
+    m_cx = 16.0                       # draw_mascot centre, from the left edge
+    layout = {"width": 0,
+              "mascot": (m_cx - MASCOT_IDLE_SIZE / 2.0,
+                         m_cx + MASCOT_IDLE_SIZE / 2.0)}
+    if kind in ("music", "download"):
+        label_w = min(310, measure(label, 10.5, True))   # long names ellipsize
+        width = max(112, int(round(MASCOT_IDLE_W + 18 + label_w + 12)))
+        layout["width"] = width
+        layout["icon"] = (float(MASCOT_IDLE_W), float(MASCOT_IDLE_W + 16))
+        x0 = MASCOT_IDLE_W + 18
+        layout["text"] = (float(x0), float(x0 + label_w))
+        return layout
+    # Clock-family states keep the template measurement so the pill does
+    # not resize every minute (timer and 24h use the short template).
+    tw = measure("88:88" if (timer_on or h24) else "88:88 PM", 10.5, True)
+    width = max(96, int(round(tw + 40))) + MASCOT_IDLE_W
+    layout["width"] = width
+    half = width / 2.0
+    if charging:
+        layout["battery"] = (half - 12.0, half + 13.0)  # battery body + nub
+    else:
+        layout["clock"] = (half - tw / 2.0, half + tw / 2.0)
+    return layout
+
+
+def mascot_look(cx, cy, size, x, y):
+    """Pointer direction from the mascot centre (cx, cy) toward (x, y),
+    scaled so the dominant component reaches what clamp_eye expects, then
+    clamped by clamp_eye and rounded to whole pixels.  The result never
+    exceeds the int(LOOK_LIMIT * size) whole-pixel clamp bound."""
+    dx, dy = x - cx, y - cy
+    m = max(abs(dx), abs(dy))
+    if m == 0.0:
+        sx = sy = 0.0
+    else:
+        sx, sy = dx * size / m, dy * size / m
+    ox, oy = clamp_eye(sx, sy, size)
+    lim = int(LOOK_LIMIT * size)
+    return (max(-lim, min(lim, int(round(ox)))),
+            max(-lim, min(lim, int(round(oy)))))
+
+
 def window_origin(gw):
     """Widget origin as (x, y), whether get_origin() returns (x, y) or the
     3-tuple (ok, x, y) this platform's PyGObject exposes."""
@@ -239,6 +312,7 @@ class Island(Gtk.Window):
             self.set_visual(visual)
         self.composited = visual is not None and screen.is_composited()
         self.add_events(Gdk.EventMask.ENTER_NOTIFY_MASK | Gdk.EventMask.LEAVE_NOTIFY_MASK
+                        | Gdk.EventMask.POINTER_MOTION_MASK
                         | Gdk.EventMask.BUTTON_PRESS_MASK)
 
         # state
@@ -313,6 +387,11 @@ class Island(Gtk.Window):
         self.dl_source = ""       # "partial", "reported", or "network"
         self.progress = {}       # app uri -> (fraction, time), from apps that report progress
         self.pending_permissions = {}  # permission_id -> {session, project, title, detail}
+        self.last_activity = time.monotonic()  # stamped on real activity, never on hover
+        # Mascot eye tracking: last drawn (centre x, centre y, size) and the
+        # whole-pixel look offset, both window coordinates; no timers.
+        self.mascot_box = None
+        self.mascot_eyes = (0, 0)
 
         # geometry (animated)
         initial_w, initial_h = self.target()
@@ -326,6 +405,7 @@ class Island(Gtk.Window):
         self.connect("enter-notify-event", self.on_enter)
         self.connect("leave-notify-event", self.on_leave)
         self.connect("button-press-event", self.on_press)
+        self.connect("motion-notify-event", self.on_motion)
         screen.connect("monitors-changed", lambda *_: self.place())
         self.place()
 
@@ -424,18 +504,12 @@ class Island(Gtk.Window):
         return "", ""
 
     def idle_w(self, dl):
+        """Compact pill width for the current state, derived from
+        idle_layout so the pill and its content cannot disagree (dl kept
+        for signature compatibility; the state comes from idle_activity)."""
         kind, label = self.idle_activity()
-        if kind:
-            # Expand horizontally just enough for a useful filename/title, but never into
-            # the tall hover card. The renderer ellipsizes unusually long names.
-            icon_w = 18 if kind == "music" else 17
-            label_w = min(310, measure(label, 10.5, True))
-            return max(112, min(360, int(round(label_w + icon_w + 34))))
-        if self.timer_end is not None or HOUR24:
-            tmpl = "88:88"
-        else:
-            tmpl = "88:88 PM"
-        return max(96, int(round(measure(tmpl, 10.5, True) + 40)))
+        return idle_layout(kind, label, self.charge_flash,
+                           self.timer_end is not None, HOUR24)["width"]
 
     def idle_target_w(self):
         return self.idle_w(self.dl_active)
@@ -532,6 +606,7 @@ class Island(Gtk.Window):
         self.queue_draw()
 
     def show_peek(self, kind, title, body="", secs=None, accent=None, app=""):
+        self.last_activity = time.monotonic()       # a visible event is activity
         if secs is None:
             secs = PEEK_SECONDS        # read at call time: hand-edit friendly
         if self.open:
@@ -580,6 +655,7 @@ class Island(Gtk.Window):
         return False
 
     def on_leave(self, widget, ev):
+        self._set_mascot_eyes(0, 0)     # pointer gone: eyes look ahead again
         self._cancel("open")
         if self.open and not self._ids["close"]:
             self._ids["close"] = once(CLOSE_HYSTERESIS_MS, self._do_close)
@@ -610,9 +686,37 @@ class Island(Gtk.Window):
         self._ids["close"] = 0
         self.set_open(False)
         self.pointer_inside = False
+        self._set_mascot_eyes(0, 0)     # the island retracts: eyes ahead
         self.retarget()
         self.queue_draw()
         return GLib.SOURCE_REMOVE
+
+    # ---- mascot eye tracking (event-driven: motion events only, no
+    # polling, no timers, no global pointer queries)
+    def _set_mascot_eyes(self, ox, oy):
+        cur = getattr(self, "mascot_eyes", (0, 0))
+        if (ox, oy) == cur:
+            return
+        self.mascot_eyes = (ox, oy)
+        self.queue_draw()
+
+    def _pointer_on_island(self, x, y):
+        """The pointer is over the VISIBLE island rectangle - the same
+        pill_rect() the hover close-check uses, not the whole transparent
+        window."""
+        rx, ry, rw, rh = self.pill_rect()
+        return rx <= x <= rx + rw and ry <= y <= ry + rh
+
+    def on_motion(self, widget, ev):
+        box = getattr(self, "mascot_box", None)
+        if box is None:
+            return False
+        cx, cy, size = box
+        if not self._pointer_on_island(ev.x, ev.y):
+            self._set_mascot_eyes(0, 0)     # outside the visible island
+            return False
+        self._set_mascot_eyes(*mascot_look(cx, cy, size, ev.x, ev.y))
+        return False
 
     def on_press(self, widget, ev):
         if ev.button == 3:
@@ -720,6 +824,7 @@ class Island(Gtk.Window):
     def start_timer(self, mins):
         self.timer_mins = mins
         self.timer_end = time.monotonic() + mins * 60
+        self.last_activity = time.monotonic()       # the timer itself is activity
         self.ensure_sec()
         self.retarget()
 
@@ -744,6 +849,8 @@ class Island(Gtk.Window):
         self._media.init_mpris(self.bus)
 
     def update_player(self, sender, props, announce=True):
+        if props.get("PlaybackStatus") == "Playing":
+            self.last_activity = time.monotonic()   # music started or resumed
         self._media.update_player(sender, props, announce)
 
     def current_player(self):
@@ -1209,6 +1316,37 @@ class Island(Gtk.Window):
                 self.oc_sessions[session]["ts"] = time.monotonic()
         self._on_opencode_permission_decision(pid, decision)
 
+    # ---- mascot mood (recomputed at draw time; no timers)
+    def mascot_mood(self, now=None):
+        """Mood for the capsule mascot, from existing state only.
+
+        Priority: a pending permission request, a fresh failed row, a fresh
+        done row, a not-stale working row (see OC_STALE_AFTER), sleep after
+        MASCOT_SLEEP_AFTER seconds of quiet, otherwise idle. Hovering is
+        never activity.  getattr fallbacks keep stub-based headless draws
+        working before deferred_init runs.
+        """
+        if now is None:
+            now = time.monotonic()
+        if getattr(self, "pending_permissions", None):
+            return "permission"
+        sessions = getattr(self, "oc_sessions", None) or {}
+        for row in sessions.values():
+            if (row.get("state") == "failed"
+                    and now - row.get("ts", now) < OC_MOOD_FAILED_S):
+                return "failed"
+        for row in sessions.values():
+            if (row.get("state") == "done"
+                    and now - row.get("ts", now) < OC_MOOD_DONE_S):
+                return "done"
+        for row in sessions.values():
+            if (row.get("state") == "working"
+                    and now - row.get("ts", now) <= OC_STALE_AFTER):
+                return "working"
+        if now - getattr(self, "last_activity", 0.0) > MASCOT_SLEEP_AFTER:
+            return "sleeping"
+        return "idle"
+
     # ---- downloads
     # Two sources, both cheap:
     #  * apps that report progress with the Unity "LauncherEntry" D-Bus signal (it is how
@@ -1302,6 +1440,7 @@ class Island(Gtk.Window):
     def dl_start(self, source="partial"):
         self.dl_active = True
         self.dl_source = source
+        self.last_activity = time.monotonic()       # the download itself is activity
         self.ensure_visual_tick()
         self.dl_bytes = 0        # count only bytes after confirmation; dl_pending is for hit detection only
         self.dl_peak = self.dl_rate or 0.0
@@ -1435,48 +1574,81 @@ class Island(Gtk.Window):
         cr.restore()
 
     def draw_idle(self, cr):
+        kind, label = self.idle_activity()
+        lay = idle_layout(kind, label, self.charge_flash,
+                          self.timer_end is not None, HOUR24)
         cy = TOP_MARGIN + IDLE_H / 2.0
+        px, _py, pw, _ph = self.pill_rect()
+        # The mascot rides at the far left of the pill in every state (mood
+        # recomputed here at draw time), including the charge flash; the
+        # box records where it was drawn for eye tracking.
+        edx, edy = getattr(self, "mascot_eyes", (0, 0))
+        self.mascot_box = (px + 16, cy, float(MASCOT_IDLE_SIZE))
+        draw_mascot(cr, px + 16, cy, MASCOT_IDLE_SIZE, self.mascot_mood(), edx, edy)
         # A charger connection gets a short animated battery-only appearance, then disappears.
-        if self.charge_flash and not self.media_playing() and not self.dl_active:
+        if self.charge_flash and kind == "":
             pct = self.batt_draw_pct if self.batt_draw_pct is not None else (self.batt_pct or 0)
-            draw_battery(cr, WIN_W / 2.0 - 11, cy, pct, True, GREEN,
+            draw_battery(cr, px + pw / 2.0 - 11, cy, pct, True, GREEN,
                          0.5 + 0.5 * math.sin(self.charge_phase * 2 * math.pi))
             return
-        # During activity, replace the clock with the actual track/file name. The pill
-        # grows sideways only; the full controls still appear on hover.
-        kind, activity_label = self.idle_activity()
-        if kind:
-            available = max(40, self.w - 48)
-            label_width = min(available, 310)
+        slot = lay.get("icon")
+        if slot is not None:
+            # New layout: mascot at the far left, then the icon, then the
+            # rest (never clipped: the width guard covers animation frames).
+            ix = px + slot[0]
+            tx = px + lay["text"][0]
+            tw = max(30, min(int(lay["text"][1] - lay["text"][0]),
+                             int(px + pw - 12 - tx)))
             if kind == "music":
-                icon_x = WIN_W / 2.0 - (min(self.w, measure(activity_label, 10.5, True) + 52)) / 2.0
-                draw_bars(cr, icon_x, cy, GREEN, self.music_phase)
-                draw_text(cr, activity_label, icon_x + 18, cy, 10.5, WHITE, bold=True,
-                          width=max(30, label_width))
+                draw_bars(cr, ix, cy, GREEN, self.music_phase)
             else:
                 fill, col, known = self.dl_bar()
-                total = min(self.w, measure(activity_label, 10.5, True) + 54)
-                icon_x = WIN_W / 2.0 - total / 2.0
-                draw_down_arrow(cr, icon_x + 5, cy, col, 0.9)
-                draw_text(cr, activity_label, icon_x + 17, cy, 10.5, WHITE, bold=True,
-                          width=max(30, label_width))
-                px, _, pw, _ = self.pill_rect()
+                draw_down_arrow(cr, ix + 5, cy, col, 0.9)
                 if known:
                     progress_bar(cr, px + 16, TOP_MARGIN + IDLE_H - 1, pw - 32, 3, fill, col)
                 else:
                     indeterminate_bar(cr, px + 16, TOP_MARGIN + IDLE_H - 1, pw - 32, 3,
                                       self.dl_phase, col)
+            draw_text(cr, label, tx, cy, 10.5, WHITE, bold=True, width=tw)
             return
         txt = fmt_mmss(max(0, self.timer_left())) if self.timer_end is not None else clock_text()
         color = ORANGE if self.timer_end is not None else WHITE
-        draw_text(cr, txt, WIN_W / 2.0, cy, 10.5, color, bold=True, align=1)
+        draw_text(cr, txt, px + pw / 2.0, cy, 10.5, color, bold=True, align=1)
+
+    def peek_mood(self, pk):
+        """Mascot mood for the peek being drawn, from the peek itself.
+
+        The bridge replaces peek titles with the project name, so a happy
+        done peek is recognised by its GREEN accent as well as the direct
+        show_peek call's title."""
+        kind = pk.get("kind", "")
+        if kind == "opencode-error":
+            return "failed"
+        if kind == "opencode-alert":
+            pid = pk.get("permission_id")
+            if pid and pid in getattr(self, "pending_permissions", {}):
+                return "permission"
+        if kind == "opencode":
+            if ("Response finished" in pk.get("title", "")
+                    or pk.get("accent") == GREEN):
+                return "done"
+            if pk.get("accent") == BLUE:
+                return "working"
+        return "idle"
 
     def draw_peek(self, cr):
         pk = self.peek
         if not pk:
             return
         px, py = (WIN_W - PEEK_W) / 2.0, float(TOP_MARGIN)
-        cx, cy = px + 32, py + PEEK_H / 2.0
+        cy = py + PEEK_H / 2.0
+        # The mascot rides at the left of every peek, mood taken from the peek
+        # itself; the icon circle and text shift right to clear it. Permission
+        # buttons keep their right-anchored geometry (hit targets unchanged).
+        edx, edy = getattr(self, "mascot_eyes", (0, 0))
+        self.mascot_box = (px + 17, cy, float(MASCOT_PEEK_SIZE))
+        draw_mascot(cr, px + 17, cy, MASCOT_PEEK_SIZE, self.peek_mood(pk), edx, edy)
+        cx = px + 52
         kind = pk["kind"]
         accent = pk["accent"] or WHITE
         cr.set_source_rgba(1, 1, 1, 0.14)
@@ -1510,7 +1682,7 @@ class Island(Gtk.Window):
             draw_text(cr, "×", cx, cy, 12, accent if pk["accent"] else ORANGE, bold=True, align=1)
         else:  # music
             draw_bars(cr, cx - 6, cy, GREEN)
-        tx, tw = px + 62, PEEK_W - 62 - 20
+        tx, tw = px + 82, PEEK_W - 82 - 20
         if pk["body"]:
             draw_text(cr, pk["title"], tx, py + 21, 10.5, WHITE, bold=True, width=tw)
             draw_text(cr, pk["body"], tx, py + 40, 9, DIM, width=tw)
@@ -1585,12 +1757,18 @@ class Island(Gtk.Window):
         left, right = ox + 22, ox + OPEN_W - 22
         cur = self.current_player()
 
-        # Tab row: Home, OpenCode, System
+        # Tab row: the mascot sits at the left end, showing the island's
+        # mood (recomputed at draw time) and tracking the pointer; the tab
+        # pills shift right to clear it and the hits follow the pills.
+        edx, edy = getattr(self, "mascot_eyes", (0, 0))
+        self.mascot_box = (left + 10, oy + TAB_ROW_H / 2.0, float(MASCOT_CARD_SIZE))
+        draw_mascot(cr, left + 10, oy + TAB_ROW_H / 2.0, MASCOT_CARD_SIZE,
+                    self.mascot_mood(), edx, edy)
         ty = oy + 8
         th = 28
         gap = 8
-        tw = (OPEN_W - 44 - 2 * gap) / 3.0
-        tx = left
+        tw = (right - (left + 30) - 2 * gap) / 3.0
+        tx = left + 30
         for label in ("Home", "OpenCode", "System"):
             active = self.open_tab == label
             tab_pill(cr, tx, ty, tw, th, label, active)
@@ -1670,6 +1848,7 @@ class Island(Gtk.Window):
     def oc_sessions_update(self, info):
         """Merge one bridge session event into the live row table.  Returns
         False so the GLib.idle_add that invokes it never repeats."""
+        self.last_activity = time.monotonic()       # an OpenCode event is activity
         session = info["session"]
         state = info["state"]
         if state == "closed":
