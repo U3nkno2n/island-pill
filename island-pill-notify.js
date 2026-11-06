@@ -30,6 +30,9 @@ const dedup = new Map();
 // Sessions that already announced their one "working" peek for the current
 // turn: further activity events stay silent until the turn ends.
 const busy = new Set();
+// Every session id seen in this process, so we can announce them as closed
+// when the process exits or a session is deleted.
+const seenSessions = new Set();
 
 const now = () => Date.now();
 
@@ -203,8 +206,22 @@ function permissionAsk(input, projectName) {
   return promise;
 }
 
+// Announce every seen session as closed, then clear the set so we don't
+// announce the same session twice.  Used on process exit and on
+// session.deleted events.
+function announceClosed() {
+  for (const session of seenSessions) {
+    sendEvent({ type: "closed", session });
+  }
+  seenSessions.clear();
+}
+
 // Establish the control connection on module load.
 connectControl();
+
+// Report every seen session as closed when this plugin process exits.
+// We deliberately do NOT register SIGINT/SIGTERM handlers here.
+process.on("exit", announceClosed);
 
 // OpenCode 1.19.5 plugin entry point. Receives PluginInput and returns Hooks.
 export const server = async ({ project, client, directory, worktree }) => {
@@ -260,6 +277,7 @@ export const server = async ({ project, client, directory, worktree }) => {
       }
 
       const sessionID = properties.sessionID || "";
+      if (sessionID) seenSessions.add(sessionID);
       debugLog("event-received", { type, sessionID });
 
       // ---------- session created ----------
@@ -373,13 +391,26 @@ export const server = async ({ project, client, directory, worktree }) => {
 
       // ---------- permission answered ----------
       if (type === "permission.replied" || type === "permission.rejected") {
-        const requestID = properties.id || properties.permissionID || "";
+        const requestID =
+          properties.requestID || properties.permissionID || properties.id || "";
         const key = dedupKey(type, sessionID, requestID);
         if (!isStale(key)) {
           debugLog("event-ignored", { reason: "dedup-hit", type, sessionID });
           return;
         }
         markDedup(key);
+        // Report the reply to the island so it can clear the pending
+        // permission and move the row back to Working.
+        sendEvent({
+          type: "permission.replied",
+          session: sessionID,
+          reqid: requestID,
+        });
+        debugLog("permission-replied-event", {
+          sessionID,
+          requestID,
+          propertyNames: Object.keys(properties),
+        });
         const s = pending.get(sessionID);
         if (s) {
           s.delete(requestID);
@@ -515,6 +546,21 @@ export const server = async ({ project, client, directory, worktree }) => {
         });
         return;
       }
+
+      // ---------- session deleted ----------
+      if (type === "session.deleted") {
+        // This session is gone: announce only this session as closed so the
+        // host removes its row from the OpenCode tab.  Read the id from
+        // properties.info.id, falling back to properties.sessionID.
+        const closedSession = properties.info && properties.info.id
+          ? String(properties.info.id)
+          : sessionID;
+        if (closedSession) {
+          seenSessions.delete(closedSession);
+          sendEvent({ type: "closed", session: closedSession });
+        }
+        return;
+      }
     },
     "permission.ask": async (input, output) => {
       // Forward the permission request to the island pill and await the
@@ -534,3 +580,8 @@ export const server = async ({ project, client, directory, worktree }) => {
 
   return hooks;
 };
+
+// Only "server" may be exported by the OpenCode plugin (every exported
+// function is treated as a plugin).  Attach announceClosed as a property so
+// tests can call it directly without exporting a second plugin entry.
+server.announceClosed = announceClosed;

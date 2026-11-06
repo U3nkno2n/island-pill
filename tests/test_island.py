@@ -526,6 +526,7 @@ class TestOpenCodePermissionHandling(unittest.TestCase):
         self.win.get_mapped = lambda: False
         self.win._cancel = lambda key: None
         self.win._oc_bridge = None
+        self.win.oc_sessions = {}
 
     def test_permission_register_shows_peek_30_seconds(self):
         """Registering a permission shows a peek that stays for
@@ -660,6 +661,7 @@ class TestClickExpandAndPeeks(unittest.TestCase):
         self.win.idle_target_h = lambda: 34
         self.win.open_tab = "Home"
         self.win.hits = []
+        self.win.oc_sessions = {}
         self._capture_timeouts()
 
     def tearDown(self):
@@ -786,6 +788,169 @@ class TestClickExpandAndPeeks(unittest.TestCase):
         self.win.peek = {"kind": "notify", "title": "Hi"}
         self.win.on_press(None, type("Ev", (), {"button": 1})())
         self.assertFalse(self.win.peek_on)
+
+
+class TestOpenCodeSessionRows(unittest.TestCase):
+    """Session rows on the OpenCode tab must follow reality."""
+
+    def setUp(self):
+        self.win = island_pill.Island.__new__(island_pill.Island)
+        self.win.open = False
+        self.win.open_tab = "OpenCode"
+        self.win.pointer_inside = False
+        self.win.peek_on = False
+        self.win.peek = {}
+        self.win.pending_peek = None
+        self.win.pending_permissions = {}
+        self.win._ids = {"open": 0, "close": 0, "peek": 0, "sec": 0}
+        self.win.dl_dir = island_pill.download_dir()
+        self.win.retarget = lambda: None
+        self.win.queue_draw = lambda: None
+        self.win.get_mapped = lambda: False
+        self.win._cancel = lambda key: None
+        self.win._oc_bridge = None
+        self.win.oc_sessions = {}
+        self.win.activity_visible = lambda: False
+        self.win.media_playing = lambda: False
+        self.win.batt_state = 0
+        self.win.dl_active = False
+
+    def _draw_opencode_only(self):
+        surf = cairo.ImageSurface(cairo.FORMAT_ARGB32,
+                                  island_pill.WIN_W, island_pill.WIN_H)
+        cr = cairo.Context(surf)
+        self.win._draw_opencode(cr, island_pill.TAB_ROW_H, 0, island_pill.OPEN_W)
+        return surf, cr
+
+    def test_oc_sessions_update_closed_removes_row(self):
+        """A "closed" state removes that session's row."""
+        self.win.oc_sessions["s1"] = {
+            "project": "myproj", "state": "working", "ts": time.monotonic(),
+        }
+        self.win.oc_sessions_update({
+            "session": "s1",
+            "state": "closed",
+            "project": "myproj",
+            "ts": time.monotonic(),
+        })
+        self.assertNotIn("s1", self.win.oc_sessions)
+
+    def test_oc_sessions_update_replied_moves_to_working(self):
+        """A "replied" notice clears the pending permission, dismisses the
+        peek, and moves the row from Approval to Working."""
+        self.win.oc_sessions["s1"] = {
+            "project": "myproj", "state": "approval", "ts": time.monotonic(),
+        }
+        self.win.pending_permissions["perm-1"] = {
+            "session": "s1", "project": "myproj", "title": "Edit", "detail": "bash",
+        }
+        self.win.peek_on = True
+        self.win.peek = {"permission_id": "perm-1", "kind": "opencode-alert"}
+
+        self.win._on_opencode_permission_register({
+            "type": "replied",
+            "permission_id": "perm-1",
+            "session": "s1",
+            "project": "myproj",
+            "title": "Edit file.py",
+            "detail": "bash",
+            "ts": time.monotonic(),
+        })
+
+        self.assertNotIn("perm-1", self.win.pending_permissions)
+        self.assertFalse(self.win.peek_on)
+        self.assertEqual(self.win.oc_sessions["s1"]["state"], "working")
+
+    def test_draw_opencode_age_out_done_failed(self):
+        """Done/Failed rows older than 15 minutes are dropped at draw time."""
+        old = time.monotonic() - 16 * 60  # 16 minutes ago
+        self.win.oc_sessions["done1"] = {"project": "DoneProj", "state": "done", "ts": old}
+        self.win.oc_sessions["fail1"] = {"project": "FailProj", "state": "failed", "ts": old}
+        self.win.oc_sessions["fresh"] = {"project": "FreshProj", "state": "working", "ts": time.monotonic()}
+
+        self._draw_opencode_only()
+
+        self.assertNotIn("done1", self.win.oc_sessions)
+        self.assertNotIn("fail1", self.win.oc_sessions)
+        self.assertIn("fresh", self.win.oc_sessions)
+
+    def test_draw_opencode_age_out_working(self):
+        """A Working row with no event for 30 minutes is dropped at draw time."""
+        old = time.monotonic() - 31 * 60  # 31 minutes ago
+        self.win.oc_sessions["stale"] = {"project": "StaleProj", "state": "working", "ts": old}
+
+        self._draw_opencode_only()
+
+        self.assertNotIn("stale", self.win.oc_sessions)
+
+    def test_draw_opencode_working_idle_at_10_minutes(self):
+        """A Working row at 10 minutes still shows "Idle" (not dropped)."""
+        old = time.monotonic() - 10 * 60  # exactly 10 minutes ago
+        self.win.oc_sessions["idle10"] = {"project": "IdleProj", "state": "working", "ts": old}
+
+        self._draw_opencode_only()
+        # Should not crash and the row should still be there
+        self.assertIn("idle10", self.win.oc_sessions)
+
+    def test_draw_opencode_unknown_state_no_crash(self):
+        """Unknown states must never crash the sort or the draw."""
+        self.win.oc_sessions["weird"] = {"project": "WeirdProj", "state": "mystery", "ts": time.monotonic()}
+
+        # Should not raise
+        self._draw_opencode_only()
+        self.assertIn("weird", self.win.oc_sessions)
+
+    def test_opencode_decision_deny_moves_row_to_working(self):
+        """Clicking Deny on a permission peek moves the row to Working and
+        host_decision gets "deny"."""
+        bridge_calls = []
+        self.win._oc_bridge = type("B", (), {
+            "host_decision": lambda self_, pid, decision: bridge_calls.append((pid, decision))
+        })()
+
+        self.win.oc_sessions["s1"] = {
+            "project": "myproj", "state": "approval", "ts": time.monotonic(),
+        }
+        self.win.pending_permissions["perm-1"] = {
+            "session": "s1", "project": "myproj", "title": "Edit", "detail": "bash",
+        }
+
+        self.win.opencode_decision("perm-1", "deny")
+
+        self.assertEqual(bridge_calls, [("perm-1", "deny")])
+        self.assertNotIn("perm-1", self.win.pending_permissions)
+        self.assertEqual(self.win.oc_sessions["s1"]["state"], "working")
+
+    def test_opencode_decision_allow_one_row_only(self):
+        """With two sessions both in Approval, Allow on one permission id
+        moves only that session's row to Working (no fallback to the first
+        approval row)."""
+        bridge_calls = []
+        self.win._oc_bridge = type("B", (), {
+            "host_decision": lambda self_, pid, decision: bridge_calls.append((pid, decision))
+        })()
+
+        self.win.oc_sessions["s1"] = {
+            "project": "proj-one", "state": "approval", "ts": time.monotonic(),
+        }
+        self.win.oc_sessions["s2"] = {
+            "project": "proj-two", "state": "approval", "ts": time.monotonic(),
+        }
+        self.win.pending_permissions["perm-one"] = {
+            "session": "s1", "project": "proj-one", "title": "Edit one", "detail": "bash",
+        }
+        self.win.pending_permissions["perm-two"] = {
+            "session": "s2", "project": "proj-two", "title": "Edit two", "detail": "bash",
+        }
+
+        self.win.opencode_decision("perm-one", "allow")
+
+        self.assertEqual(bridge_calls, [("perm-one", "allow")])
+        self.assertNotIn("perm-one", self.win.pending_permissions)
+        # s1 moved to Working
+        self.assertEqual(self.win.oc_sessions["s1"]["state"], "working")
+        # s2 untouched, still Approval
+        self.assertEqual(self.win.oc_sessions["s2"]["state"], "approval")
 
 
 class TestOpenTabsHeadless(unittest.TestCase):

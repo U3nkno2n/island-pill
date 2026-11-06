@@ -109,6 +109,8 @@ BLACK = (0, 0, 0, 1) if NOTCH else (0.02, 0.02, 0.02, 1)
 
 # Live session rows on the OpenCode tab (display-only; state comes from events).
 OC_STALE_AFTER = 600.0            # seconds a "working" row may go quiet before it paints as "Idle"
+OC_IDLE_AFTER = 30 * 60           # seconds a "working" row may go quiet before it's dropped
+OC_DONE_FAILED_AFTER = 15 * 60    # seconds a "done"/"failed" row may exist before it's dropped
 OC_ROW_ORDER = {"approval": 0, "working": 1, "done": 2, "failed": 2}
 OC_ROW_TEXT = {"working": "Working", "approval": "Approval",
                "done": "Done", "failed": "Failed"}
@@ -1127,7 +1129,24 @@ class Island(Gtk.Window):
     # ---- OpenCode permission handling ----
     def _on_opencode_permission_register(self, info):
         """Bridge callback: a new OpenCode permission request has arrived.
-        Register it and show a peek with Allow / Deny controls."""
+
+        Handles both "register" (new permission request -> show Allow/Deny
+        peek) and "replied" (user answered in terminal -> clear pending
+        permission, dismiss peek, move row back to Working)."""
+        if info.get("type") == "replied":
+            pid = info["permission_id"]
+            self.pending_permissions.pop(pid, None)
+            if self.peek.get("permission_id") == pid:
+                self.end_peek()
+            # Move the row back to Working.
+            session = info.get("session", "")
+            if session in self.oc_sessions:
+                self.oc_sessions[session]["state"] = "working"
+                self.oc_sessions[session]["ts"] = info.get("ts", time.monotonic())
+            self.retarget()
+            self.queue_draw()
+            return
+
         pid = info["permission_id"]
         self.pending_permissions[pid] = {
             "session": info.get("session", ""),
@@ -1174,9 +1193,20 @@ class Island(Gtk.Window):
         self.queue_draw()
 
     def opencode_decision(self, pid, decision):
-        """Called from peek hit targets: forward Allow/Deny to the bridge."""
+        """Called from peek hit targets: forward Allow/Deny to the bridge
+        and move the row back to Working."""
         if self._oc_bridge:
             self._oc_bridge.host_decision(pid, decision)
+        # Clicking Allow or Deny moves the row back to Working.  Find the
+        # session ONLY from pending_permissions for that permission id
+        # (before it is popped).  If not found, do not touch any row -- no
+        # "first approval row" fallback.
+        entry = self.pending_permissions.get(pid)
+        if entry is not None:
+            session = entry.get("session", "")
+            if session and session in self.oc_sessions:
+                self.oc_sessions[session]["state"] = "working"
+                self.oc_sessions[session]["ts"] = time.monotonic()
         self._on_opencode_permission_decision(pid, decision)
 
     # ---- downloads
@@ -1640,9 +1670,14 @@ class Island(Gtk.Window):
     def oc_sessions_update(self, info):
         """Merge one bridge session event into the live row table.  Returns
         False so the GLib.idle_add that invokes it never repeats."""
-        self.oc_sessions[info["session"]] = {
-            "project": info["project"], "state": info["state"], "ts": info["ts"],
-        }
+        session = info["session"]
+        state = info["state"]
+        if state == "closed":
+            self.oc_sessions.pop(session, None)
+        else:
+            self.oc_sessions[session] = {
+                "project": info["project"], "state": state, "ts": info["ts"],
+            }
         self._oc_sessions_prune()
         if self.open_tab == "OpenCode":
             self.queue_draw()
@@ -1661,36 +1696,51 @@ class Island(Gtk.Window):
 
     def _oc_session_rows(self):
         """Rows in draw order: approval, then working, then done/failed,
-        newest first within each group."""
+        newest first within each group.  Unknown states sort last and never
+        crash the sort."""
         return sorted(
             self.oc_sessions.items(),
-            key=lambda kv: (OC_ROW_ORDER.get(kv[1]["state"], 3), -kv[1]["ts"]),
+            key=lambda kv: (OC_ROW_ORDER.get(kv[1].get("state", ""), 3), -kv[1]["ts"]),
         )
 
     def _draw_opencode(self, cr, oy, left, right):
         # one card, one row per live session: state dot, project name, state
         w = right - left
         card(cr, left, oy + 12, w, OPENCODE_CONTENT_H - 24)
+        now = time.monotonic()
+        # Age-out at draw time (no timers): drop Done/Failed rows older than
+        # 15 minutes and Working rows with no event for 30 minutes.  Unknown
+        # states never crash the draw.
+        rows_to_drop = []
+        for sid, row in self.oc_sessions.items():
+            state = row.get("state", "")
+            ts = row.get("ts", now)
+            age = now - ts
+            if state in ("done", "failed") and age > OC_DONE_FAILED_AFTER:
+                rows_to_drop.append(sid)
+            elif state == "working" and age > OC_IDLE_AFTER:
+                rows_to_drop.append(sid)
+        for sid in rows_to_drop:
+            del self.oc_sessions[sid]
         rows = self._oc_session_rows()[:6]
         if not rows:
             draw_text(cr, "No sessions yet", left + w / 2.0,
                       oy + 12 + (OPENCODE_CONTENT_H - 24) / 2.0, 11, DIM,
                       align=1)
             return
-        now = time.monotonic()
         cx = left + HOME_CARD_PAD + 4
         name_x = left + HOME_CARD_PAD + 12
         for i, (_sid, row) in enumerate(rows):
             cy = oy + 21 + 18 * i
-            state = row["state"]
-            if state == "working" and now - row["ts"] > OC_STALE_AFTER:
+            state = row.get("state", "")
+            if state == "working" and now - row.get("ts", now) > OC_STALE_AFTER:
                 col, txt = FAINT, "Idle"
             else:
                 col = OC_ROW_COLOR.get(state, BLUE)
                 txt = OC_ROW_TEXT.get(state, "Working")
             state_dot(cr, cx, cy, 3.5, col)
             sw = measure(txt, 9)
-            draw_text(cr, row["project"] or "OpenCode", name_x, cy, 9.5, WHITE,
+            draw_text(cr, row.get("project") or "OpenCode", name_x, cy, 9.5, WHITE,
                       bold=True, width=max(30, right - HOME_CARD_PAD - name_x
                                            - sw - 10))
             draw_text(cr, txt, right - HOME_CARD_PAD, cy, 9, DIM, align=2)

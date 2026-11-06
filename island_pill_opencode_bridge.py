@@ -48,9 +48,11 @@ _OC_SESSION_STATE = {
     "started": "working",
     "working": "working",
     "permission": "approval",
+    "permission.replied": "working",
     "done": "done",
     "failed": "failed",
     "cancelled": "failed",
+    "closed": "closed",
 }
 
 WHITE = (1, 1, 1, 1)
@@ -312,10 +314,10 @@ class OpenCodeBridge:
         if not isinstance(msg, dict):
             return
         mtype = msg.get("type")
-        if mtype not in (
+        if         mtype not in (
             "opencode", "opencode-alert", "opencode-error", "selftest",
             "control", "started", "working", "done", "failed", "cancelled",
-            "permission",
+            "permission", "permission.replied", "closed",
         ):
             return
 
@@ -335,14 +337,17 @@ class OpenCodeBridge:
                                "state": state, "ts": time.monotonic()})
 
         # Dedup with a per-key TTL, separate from Pill's last_notif.
-        key = (mtype, session)
+        # permission, permission.replied and closed carry a request id, so
+        # include it in the key to avoid suppressing distinct requests.
+        dedup_key = (mtype, session, permission_id) if mtype in (
+            "permission", "permission.replied", "closed") else (mtype, session)
         now = time.monotonic()
-        last = self.last_peek.get(key, 0.0)
+        last = self.last_peek.get(dedup_key, 0.0)
         if now - last < DEDUP_TTL:
             # Duplicate within TTL: still ACK, but do not show peek.
             self._send_ack(client)
             return
-        self.last_peek[key] = now
+        self.last_peek[dedup_key] = now
         self._clean_dedup(now)
 
         # Route to peek kind.
@@ -448,6 +453,28 @@ class OpenCodeBridge:
                 # overwrite the peek dict (losing permission_id) and
                 # re-enable the auto-dismiss timer.
                 show = False
+        elif mtype == "permission.replied":
+            # The user answered in the terminal (or anywhere).  Clear the
+            # pending permission, dismiss its peek if showing, and move the
+            # row back to Working.
+            if session and permission_id:
+                self.pending_permissions.pop((session, permission_id), None)
+                if self.decision_callback:
+                    GLib.idle_add(
+                        self.decision_callback,
+                        {
+                            "type": "replied",
+                            "permission_id": permission_id,
+                            "session": session,
+                            "project": project,
+                            "title": title,
+                            "detail": body,
+                        },
+                    )
+            show = False
+        elif mtype == "closed":
+            # Host removes this session's row; no peek is shown.
+            show = False
 
         if show:
             GLib.idle_add(self._show_peek, kind, title, body, secs, accent, project)
