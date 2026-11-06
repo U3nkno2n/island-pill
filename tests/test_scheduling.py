@@ -88,7 +88,7 @@ def test_host_uses_wrappers_expected_counts():
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
             if node.func.id in counts:
                 counts[node.func.id] += 1
-    assert counts == {"once": 7, "loop_ms": 2, "loop_seconds": 3, "cancel": 2}
+    assert counts == {"once": 8, "loop_ms": 2, "loop_seconds": 3, "cancel": 2}
 
 
 def test_wrapper_identity_on_host():

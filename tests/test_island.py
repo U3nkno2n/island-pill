@@ -165,7 +165,7 @@ class TestShowPeekHoverOnly(unittest.TestCase):
         self.win.peek_on = False
         self.win.peek = {}
         self.win.pending_peek = None
-        self.win._ids = {"open": 0, "close": 0, "peek": 0, "sec": 0}
+        self.win._ids = {"open": 0, "close": 0, "peek": 0, "sec": 0, "face": 0}
         self.win.dl_dir = island_pill.download_dir()
         self.win.retarget = lambda: None
         self.win.queue_draw = lambda: None
@@ -245,7 +245,7 @@ class TestPendingPeekPromotion(unittest.TestCase):
             "accent": island_pill.GREEN,
             "app": "",
         }
-        self.win._ids = {"open": 0, "close": 0, "peek": 0, "sec": 0}
+        self.win._ids = {"open": 0, "close": 0, "peek": 0, "sec": 0, "face": 0}
         self.win.dl_dir = island_pill.download_dir()
         self.win.retarget = lambda: None
         self.win.queue_draw = lambda: None
@@ -519,7 +519,7 @@ class TestOpenCodePermissionHandling(unittest.TestCase):
         self.win.peek = {}
         self.win.pending_peek = None
         self.win.pending_permissions = {}
-        self.win._ids = {"open": 0, "close": 0, "peek": 0, "sec": 0}
+        self.win._ids = {"open": 0, "close": 0, "peek": 0, "sec": 0, "face": 0}
         self.win.dl_dir = island_pill.download_dir()
         self.win.retarget = lambda: None
         self.win.queue_draw = lambda: None
@@ -647,7 +647,7 @@ class TestClickExpandAndPeeks(unittest.TestCase):
         self.win.peek = {}
         self.win.pending_peek = None
         self.win.pending_permissions = {}
-        self.win._ids = {"open": 0, "close": 0, "peek": 0, "sec": 0}
+        self.win._ids = {"open": 0, "close": 0, "peek": 0, "sec": 0, "face": 0}
         self.win.dl_dir = island_pill.download_dir()
         self.win.retarget = lambda: None
         self.win.queue_draw = lambda: None
@@ -802,7 +802,7 @@ class TestOpenCodeSessionRows(unittest.TestCase):
         self.win.peek = {}
         self.win.pending_peek = None
         self.win.pending_permissions = {}
-        self.win._ids = {"open": 0, "close": 0, "peek": 0, "sec": 0}
+        self.win._ids = {"open": 0, "close": 0, "peek": 0, "sec": 0, "face": 0}
         self.win.dl_dir = island_pill.download_dir()
         self.win.retarget = lambda: None
         self.win.queue_draw = lambda: None
@@ -960,6 +960,7 @@ class TestOpenTabsHeadless(unittest.TestCase):
         self.win = island_pill.Island.__new__(island_pill.Island)
         self.win.open_tab = "Home"
         self.win.hits = []
+        self.win.h = float(island_pill.OPEN_H_BASE)   # draw_open's animated height
         self.win.oc_sessions = {}
         self.win.current_player = lambda: None
         self.win.cpu_pct = None
@@ -1010,6 +1011,7 @@ class TestOpenTilesHeadless(unittest.TestCase):
         self.win = island_pill.Island.__new__(island_pill.Island)
         self.win.open_tab = "Home"
         self.win.hits = []
+        self.win.h = float(island_pill.OPEN_H_BASE)   # draw_open's animated height
         self.win.current_player = lambda: None
         self.win.timer_end = None
         self.win.dl_phase = 0.5
@@ -1084,8 +1086,9 @@ class TestOpenSystemStatesHeadless(unittest.TestCase):
 
     def setUp(self):
         self.win = island_pill.Island.__new__(island_pill.Island)
-        self.win.open_tab = "System"
+        self.win.open_tab = "Home"
         self.win.hits = []
+        self.win.h = float(island_pill.OPEN_H_BASE)   # draw_open's animated height
         self.win.current_player = lambda: None
         self.win.cpu_pct = None
         self.win.mem_used = None
@@ -1129,6 +1132,7 @@ class TestOpenSessionsHeadless(unittest.TestCase):
         self.win = island_pill.Island.__new__(island_pill.Island)
         self.win.open_tab = "OpenCode"
         self.win.hits = []
+        self.win.h = float(island_pill.OPEN_H_BASE)   # draw_open's animated height
         self.win.oc_sessions = {}
         self.win.current_player = lambda: None
         self.win.queue_draw = lambda: None
@@ -1271,6 +1275,919 @@ class TestOpenHeightMax(unittest.TestCase):
             island_pill.WIN_H,
             island_pill.TOP_MARGIN + island_pill.OPEN_H_MAX,
         )
+
+
+class TestMascotMood(unittest.TestCase):
+    """mascot_mood() is computed at draw time with priorities
+    permission > failed > done > working > sleeping > idle and the
+    time limits from the mascot task."""
+
+    @staticmethod
+    def _now():
+        return time.monotonic()
+
+    def _win(self):
+        win = island_pill.Island.__new__(island_pill.Island)
+        win.pending_permissions = {}
+        win.oc_sessions = {}
+        win.last_activity = self._now()
+        return win
+
+    def test_mood_priority_table(self):
+        now = self._now()
+        cases = [
+            # (pending, failed_age, done_age, working_age, quiet_age, expected)
+            (True, 5.0, 2.0, 1.0, 0.0, "permission"),
+            (False, 5.0, 2.0, 1.0, 0.0, "failed"),
+            (False, 99.0, 2.0, 100.0, 0.0, "done"),
+            (False, None, 2.0, 1.0, 0.0, "done"),
+            (False, None, None, 1.0, 400.0, "working"),
+            (False, None, None, None, 400.0, "sleeping"),
+            (False, None, None, None, 0.0, "idle"),
+        ]
+        for i, (pending, fa, da, wa, qa, expected) in enumerate(cases):
+            with self.subTest(case=i):
+                win = self._win()
+                win.last_activity = now - qa
+                if pending:
+                    win.pending_permissions["p1"] = {"session": "s"}
+                if fa is not None:
+                    win.oc_sessions["f"] = {"project": "p", "state": "failed", "ts": now - fa}
+                if da is not None:
+                    win.oc_sessions["d"] = {"project": "p", "state": "done", "ts": now - da}
+                if wa is not None:
+                    win.oc_sessions["w"] = {"project": "p", "state": "working", "ts": now - wa}
+                self.assertEqual(win.mascot_mood(now), expected)
+
+    def test_failed_time_limit_is_ten_seconds(self):
+        now = self._now()
+        win = self._win()
+        win.oc_sessions["f"] = {"project": "p", "state": "failed", "ts": now - 9.9}
+        self.assertEqual(win.mascot_mood(now), "failed")
+        win.oc_sessions["f"]["ts"] = now - 10.0
+        self.assertEqual(win.mascot_mood(now), "idle")      # strict: over at 10s
+
+    def test_done_time_limit_is_four_seconds(self):
+        now = self._now()
+        win = self._win()
+        win.oc_sessions["d"] = {"project": "p", "state": "done", "ts": now - 3.9}
+        self.assertEqual(win.mascot_mood(now), "done")
+        win.oc_sessions["d"]["ts"] = now - 4.0
+        self.assertEqual(win.mascot_mood(now), "idle")      # strict: over at 4s
+
+    def test_working_staleness_follows_oc_stale_after(self):
+        now = self._now()
+        win = self._win()
+        win.oc_sessions["w"] = {"project": "p", "state": "working",
+                                "ts": now - island_pill.OC_STALE_AFTER}
+        self.assertEqual(win.mascot_mood(now), "working")   # at the boundary: fresh
+        win.oc_sessions["w"]["ts"] = now - island_pill.OC_STALE_AFTER - 1.0
+        self.assertEqual(win.mascot_mood(now), "idle")
+
+    def test_sleeping_after_five_quiet_minutes(self):
+        now = self._now()
+        win = self._win()
+        win.last_activity = now - island_pill.MASCOT_SLEEP_AFTER
+        self.assertEqual(win.mascot_mood(now), "idle")      # exactly 5 min: awake
+        win.last_activity = now - island_pill.MASCOT_SLEEP_AFTER - 0.1
+        self.assertEqual(win.mascot_mood(now), "sleeping")
+
+    def test_missing_last_activity_never_crashes(self):
+        """Stubs without last_activity (pre-init headless draws) draw idle."""
+        win = island_pill.Island.__new__(island_pill.Island)
+        self.assertEqual(win.mascot_mood(0.0), "idle")
+
+
+class TestMascotActivity(unittest.TestCase):
+    """last_activity is stamped by real activity (peeks, OpenCode events,
+    downloads, timers, music start) and never by hovering."""
+
+    def setUp(self):
+        self.win = island_pill.Island.__new__(island_pill.Island)
+        self.win.last_activity = 0.0
+
+    def test_hover_never_stamps(self):
+        """The mascot task: hovering must not count as activity."""
+        island_pill.HOVER_ONLY = True
+        self.win.pointer_inside = False
+        self.win.open = False
+        self.win.peek_on = False
+        self.win.peek = {}
+        self.win.pending_peek = None
+        self.win.pending_permissions = {}
+        self.win._ids = {"open": 0, "close": 0, "peek": 0, "sec": 0, "face": 0}
+        self.win.dl_dir = island_pill.download_dir()
+        self.win.retarget = lambda: None
+        self.win.queue_draw = lambda: None
+        self.win.media_playing = lambda: False
+        self.win.batt_state = 0
+        self.win.dl_active = False
+        self.win.on_enter(None, None)
+        self.assertEqual(self.win.last_activity, 0.0)
+
+    def test_show_peek_stamps(self):
+        orig = GLib.timeout_add
+        GLib.timeout_add = lambda ms, fn: 999
+        try:
+            island_pill.HOVER_ONLY = True
+            island_pill.HOVER_ONLY_PEEKS = True
+            self.win.open = False
+            self.win.peek_on = False
+            self.win.peek = {}
+            self.win.pending_peek = None
+            self.win.pending_permissions = {}
+            self.win._ids = {"open": 0, "close": 0, "peek": 0, "sec": 0, "face": 0}
+            self.win.dl_dir = island_pill.download_dir()
+            self.win.retarget = lambda: None
+            self.win.queue_draw = lambda: None
+            self.win.show_peek("battery", "Battery low", "20% remaining", secs=6)
+        finally:
+            GLib.timeout_add = orig
+        self.assertGreater(self.win.last_activity, 0.0)
+
+    def test_oc_sessions_update_stamps(self):
+        self.win.oc_sessions = {}
+        self.win.open_tab = "Home"
+        self.win.queue_draw = lambda: None
+        self.win.oc_sessions_update({"session": "s1", "project": "p",
+                                     "state": "working", "ts": time.monotonic()})
+        self.assertGreater(self.win.last_activity, 0.0)
+
+    def test_dl_start_stamps(self):
+        win = self.win
+        win.dl_pending = 0
+        win.dl_active = False
+        win.dl_source = ""
+        win.dl_name = ""
+        win.dl_bytes = 0
+        win.dl_rate = None
+        win.dl_lows = 0
+        win.dl_dir = island_pill.download_dir()
+        win.visual_id = 0
+        win.ensure_visual_tick = lambda: None
+        win.retarget = lambda: None
+        win.queue_draw = lambda: None
+        win.dl_start(source="partial")
+        self.assertGreater(win.last_activity, 0.0)
+
+    def test_start_timer_stamps(self):
+        win = self.win
+        win.timer_mins = 0
+        win.timer_end = None
+        win._ids = {"open": 0, "close": 0, "peek": 0, "sec": 0, "face": 0}
+        win.ensure_sec = lambda: None
+        win.retarget = lambda: None
+        win.start_timer(5)
+        self.assertGreater(win.last_activity, 0.0)
+
+    def test_music_start_stamps_others_do_not(self):
+        """Music start (PlaybackStatus Playing) is activity; pause and
+        metadata-only updates are not."""
+        recorded = []
+
+        class Media:
+            @staticmethod
+            def update_player(sender, props, announce=True):
+                recorded.append((sender, dict(props), announce))
+
+        self.win._media = Media()
+        self.win.update_player("s", {"PlaybackStatus": "Playing"})
+        self.assertEqual(recorded, [("s", {"PlaybackStatus": "Playing"}, True)])
+        self.assertGreater(self.win.last_activity, 0.0)
+        self.win.last_activity = 0.0
+        self.win.update_player("s", {"PlaybackStatus": "Paused"})
+        self.assertEqual(self.win.last_activity, 0.0)
+        self.win.update_player("s", {"Metadata": {}})
+        self.assertEqual(self.win.last_activity, 0.0)
+
+
+class TestMascotDraws(unittest.TestCase):
+    """Headless mascot draws: compact pill, peeks and the open card tab row
+    across every mood; hit targets exist and keep clear of the mascot area."""
+
+    MOODS = ("idle", "working", "permission", "done", "failed", "sleeping")
+
+    def setUp(self):
+        self.win = island_pill.Island.__new__(island_pill.Island)
+        self.win.open_tab = "Home"
+        self.win.hits = []
+        self.win.h = float(island_pill.OPEN_H_BASE)   # draw_open's animated height
+        self.win.pending_permissions = {}
+        self.win.oc_sessions = {}
+        self.win.last_activity = time.monotonic()
+        self.win.current_player = lambda: None
+        self.win.media_playing = lambda: False
+        self.win.batt_state = 0
+        self.win.batt_pct = None
+        self.win.batt_draw_pct = None
+        self.win.charge_flash = False
+        self.win.charge_phase = 0.0
+        self.win.timer_end = None
+        self.win.dl_active = False
+        self.win.dl_phase = 0.5
+        self.win.dl_rate = 0.0
+        self.win.dl_name = None
+        self.win.dl_bytes = 0
+        self.win.dl_bar = lambda: (0.42, (0.35, 0.62, 1.0, 1.0), True)
+        self.win.wdev = None
+        self.win.bt_powered = None
+        self.win.has_conn = lambda: False
+        self.win.cpu_pct = None
+        self.win.mem_used = None
+        self.win.mem_total = None
+        self.win.temp_cached = None
+        self.win.retarget = lambda: None
+        self.win.queue_draw = lambda: None
+        self.win.get_mapped = lambda: False
+
+    def _set_mood(self, mood):
+        now = time.monotonic()
+        self.win.pending_permissions = {}
+        self.win.oc_sessions = {}
+        self.win.last_activity = now
+        if mood == "permission":
+            self.win.pending_permissions["p1"] = {"session": "s", "project": "p",
+                                                 "title": "Edit file.py",
+                                                 "detail": "bash: rm -rf /"}
+        elif mood == "failed":
+            self.win.oc_sessions["f"] = {"project": "p", "state": "failed",
+                                         "ts": now - 1.0}
+        elif mood == "done":
+            self.win.oc_sessions["d"] = {"project": "p", "state": "done",
+                                         "ts": now - 1.0}
+        elif mood == "working":
+            self.win.oc_sessions["w"] = {"project": "p", "state": "working",
+                                         "ts": now - 1.0}
+        elif mood == "sleeping":
+            self.win.last_activity = now - 400.0
+
+    @staticmethod
+    def _surface():
+        surf = cairo.ImageSurface(cairo.FORMAT_ARGB32,
+                                  island_pill.WIN_W, island_pill.WIN_H)
+        return surf, cairo.Context(surf)
+
+    @staticmethod
+    def _mascot_area(cx, cy, size):
+        return (cx - size / 2.0, cy - size * 1.45 / 2.0, size, size * 1.45)
+
+    @staticmethod
+    def _overlaps(a, b):
+        ax, ay, aw, ah = a
+        bx, by, bw, bh = b
+        return (ax < bx + bw and bx < ax + aw
+                and ay < by + bh and by < ay + ah)
+
+    def _ink(self, surf, rect):
+        """Non-transparent pixel count inside rect (the mascot paints ink)."""
+        x, y, w, h = (max(0, int(v)) for v in rect)
+        w = min(w, island_pill.WIN_W - x)
+        h = min(h, island_pill.WIN_H - y)
+        data = surf.get_data()
+        stride = surf.get_stride()
+        count = 0
+        for py in range(y, y + h):
+            row = data[py * stride:(py + 1) * stride]
+            for px in range(x, x + w):
+                if row[px * 4 + 3]:
+                    count += 1
+        return count
+
+    def test_compact_pill_draws_mascot_for_every_mood(self):
+        for mood in self.MOODS:
+            with self.subTest(mood=mood):
+                self._set_mood(mood)
+                self.win.w = 130.0
+                self.win.h = float(island_pill.IDLE_H)
+                surf, cr = self._surface()
+                self.win.draw_idle(cr)
+                px = (island_pill.WIN_W - self.win.w) / 2.0
+                cy = island_pill.TOP_MARGIN + island_pill.IDLE_H / 2.0
+                area = self._mascot_area(px + 16, cy, island_pill.MASCOT_IDLE_SIZE)
+                self.assertGreater(self._ink(surf, area), 40)
+
+    def test_peek_mood_recognition_table(self):
+        perm = {"p1": {"session": "s", "project": "p", "title": "t", "detail": "d"}}
+        cases = [
+            ("permission", dict(kind="opencode-alert", title="OpenCode · p",
+                                permission_id="p1"), perm, "permission"),
+            ("permission pending gone", dict(kind="opencode-alert",
+                                             title="OpenCode · p",
+                                             permission_id="p1"), {}, "idle"),
+            ("failed", dict(kind="opencode-error", title="OpenCode · p"), {}, "failed"),
+            ("done by accent", dict(kind="opencode", title="OpenCode · p",
+                                    accent=island_pill.GREEN), {}, "done"),
+            ("done by title", dict(kind="opencode", title="OpenCode · Response finished",
+                                   accent=None), {}, "done"),
+            ("working", dict(kind="opencode", title="OpenCode · p",
+                             accent=island_pill.BLUE), {}, "working"),
+            ("music stays idle", dict(kind="music", title="Track", accent=None),
+             perm, "idle"),
+        ]
+        for name, pk, pending, expected in cases:
+            with self.subTest(peek=name):
+                self.win.pending_permissions = dict(pending)
+                self.assertEqual(self.win.peek_mood(dict(pk)), expected)
+
+    def test_peek_kinds_draw_mascot_and_keep_hits_right(self):
+        perm_entry = {"session": "s1", "project": "myproj", "title": "Edit file.py",
+                      "detail": "bash: rm -rf /"}
+        cases = [
+            ("permission", dict(kind="opencode-alert", title="OpenCode · myproj",
+                                body="Edit file.py\nbash: rm -rf /",
+                                accent=island_pill.ORANGE, app="OC",
+                                permission_id="p1"),
+             {"p1": perm_entry}, "permission", 2),
+            ("error", dict(kind="opencode-error", title="OpenCode · myproj",
+                           body="Request failed", accent=island_pill.ORANGE, app="OC"),
+             {}, "failed", 0),
+            ("done", dict(kind="opencode", title="OpenCode · Response finished",
+                          body="Assistant response completed",
+                          accent=island_pill.GREEN, app="OC"), {}, "done", 0),
+            ("working", dict(kind="opencode", title="OpenCode · myproj",
+                             body="OpenCode started working",
+                             accent=island_pill.BLUE, app="OC"), {}, "working", 0),
+            ("notify", dict(kind="notify", title="Hello", body="Body",
+                            accent=None, app="App"), {}, "idle", 0),
+        ]
+        for name, pk, pending, expected_mood, expected_hits in cases:
+            with self.subTest(peek=name):
+                self.win.peek = dict(pk)
+                self.win.pending_permissions = dict(pending)
+                self.win.hits = []
+                self.assertEqual(self.win.peek_mood(self.win.peek), expected_mood)
+                surf, cr = self._surface()
+                self.win.draw_peek(cr)
+                px = (island_pill.WIN_W - island_pill.PEEK_W) / 2.0
+                cy = island_pill.TOP_MARGIN + island_pill.PEEK_H / 2.0
+                area = self._mascot_area(px + 17, cy, island_pill.MASCOT_PEEK_SIZE)
+                self.assertGreater(self._ink(surf, area), 40)
+                self.assertEqual(len(self.win.hits), expected_hits)
+                for hx, hy, hw, hh, _fn in self.win.hits:
+                    self.assertFalse(self._overlaps((hx, hy, hw, hh), area))
+
+    def test_open_card_all_tabs_all_moods(self):
+        ox = (island_pill.WIN_W - island_pill.OPEN_W) / 2.0
+        m_cy = island_pill.TOP_MARGIN + self.win.h / 2.0
+        m_size = min(float(island_pill.MASCOT_TILE_SIZE), self.win.h - 16.0)
+        for tab in ("Home", "OpenCode", "System"):
+            for mood in self.MOODS:
+                with self.subTest(tab=tab, mood=mood):
+                    self._set_mood(mood)
+                    self.win.open_tab = tab
+                    self.win.hits = []
+                    surf, cr = self._surface()
+                    self.win.draw_open(cr)
+                    area = self._mascot_area(ox + 40, m_cy, m_size)
+                    self.assertGreater(self._ink(surf, area), 40)
+                    # the mascot tile plus the three tab pills (and any
+                    # content hits) - the tile hit contains the mascot
+                    self.assertGreaterEqual(len(self.win.hits), 4)
+                    for hx, hy, hw, hh, _fn in self.win.hits:
+                        contains = (hx <= area[0] and hy <= area[1]
+                                    and hx + hw >= area[0] + area[2]
+                                    and hy + hh >= area[1] + area[3])
+                        if not contains:
+                            self.assertFalse(self._overlaps((hx, hy, hw, hh), area))
+
+    def test_idle_w_reserves_mascot_segment(self):
+        """With a long enough activity label (past the 112 min clamp) the
+        compact pill widens by exactly MASCOT_IDLE_W in both idle and
+        activity widths, so clock and activity text stay unclipped."""
+        win = self.win
+        seg = island_pill.MASCOT_IDLE_W
+        orig = (win.current_player, win.media_playing, win.dl_active,
+                win.dl_name)
+        LONG = "A reasonably long name that is far past the minimum clamp"
+
+        # Identical state before/after the constant swap makes the
+        # comparison linear in MASCOT_IDLE_W.
+        def widths(dl, playing):
+            win.media_playing = lambda: playing
+            if playing:
+                win.current_player = lambda: ("s", {"title": LONG})
+            else:
+                win.current_player = lambda: None
+            win.dl_active = dl
+            win.dl_name = LONG if dl else ""
+            return win.idle_w(dl)
+
+        island_pill.MASCOT_IDLE_W = 0
+        try:
+            idle_base = widths(False, False)
+            music_base = widths(False, True)
+            dl_base = widths(True, False)
+        finally:
+            island_pill.MASCOT_IDLE_W = seg
+            win.current_player, win.media_playing, win.dl_active, win.dl_name = orig
+        self.assertEqual(widths(False, False), idle_base + seg)
+        self.assertEqual(widths(False, True), music_base + seg)
+        self.assertEqual(widths(True, False), dl_base + seg)
+
+
+class TestMascotIdleLayout(unittest.TestCase):
+    """idle_layout: state -> compact-pill content-row x-ranges. For every
+    combination of music playing, charging, download active and timer
+    running, the ranges never overlap, fit inside the pill width and put
+    the mascot at the far left; the same combinations draw headlessly."""
+
+    def test_x_ranges_never_overlap_and_fit(self):
+        for dl in (False, True):
+            for playing in (False, True):
+                for charging in (False, True):
+                    for timer in (False, True):
+                        with self.subTest(dl=dl, playing=playing,
+                                          charging=charging, timer=timer):
+                            kind = "download" if dl else ("music" if playing else "")
+                            label = "Track" if kind == "music" else (
+                                "File.zip" if kind == "download" else "")
+                            lay = island_pill.idle_layout(kind, label, charging,
+                                                          timer, False)
+                            width = lay["width"]
+                            self.assertGreater(width, 0)
+                            ranges = {n: r for n, r in lay.items() if n != "width"}
+                            # consistent with idle_activity's priority: a download
+                            # wins over music; charging/timer only matter when idle
+                            if kind:
+                                self.assertIn("icon", ranges)
+                                self.assertIn("text", ranges)
+                                self.assertNotIn("battery", ranges)
+                                self.assertNotIn("clock", ranges)
+                            elif charging:
+                                self.assertIn("battery", ranges)
+                            else:
+                                self.assertIn("clock", ranges)
+                            names = sorted(ranges, key=lambda n: ranges[n][0])
+                            for name in names:
+                                x0, x1 = ranges[name]
+                                self.assertGreaterEqual(x0, 0)
+                                self.assertLessEqual(x1, width)
+                                self.assertLess(x0, x1)
+                            for i, a in enumerate(names):
+                                for b in names[i + 1:]:
+                                    self.assertLess(ranges[a][1], ranges[b][0],
+                                                    (a, ranges[a], b, ranges[b]))
+                            self.assertEqual(ranges["mascot"],
+                                             (16.0 - island_pill.MASCOT_IDLE_SIZE / 2.0,
+                                              16.0 + island_pill.MASCOT_IDLE_SIZE / 2.0))
+                            if kind:
+                                self.assertEqual(ranges["icon"][0],
+                                                 island_pill.MASCOT_IDLE_W)
+
+    def test_idle_w_matches_layout_width(self):
+        """idle_w must be the layout's width for its state (one source)."""
+        win = island_pill.Island.__new__(island_pill.Island)
+        win.retarget = lambda: None
+        win.queue_draw = lambda: None
+        for label_name, state in (
+            ("quiet", dict(dl=False, playing=False, charging=False, timer=False)),
+            ("music", dict(dl=False, playing=True, charging=False, timer=False)),
+            ("music charging", dict(dl=False, playing=True, charging=True, timer=True)),
+            ("download", dict(dl=True, playing=True, charging=False, timer=False)),
+            ("download timer", dict(dl=True, playing=False, charging=True, timer=True)),
+            ("flash idle", dict(dl=False, playing=False, charging=True, timer=False)),
+                ):
+            with self.subTest(state=label_name):
+                win.dl_active = state["dl"]
+                win.dl_name = "File.zip" if state["dl"] else ""
+                win.media_playing = lambda: state["playing"]
+                win.current_player = (lambda: ("s", {"title": "Track"})) \
+                    if state["playing"] else (lambda: None)
+                win.charge_flash = state["charging"]
+                win.timer_end = time.monotonic() + 300 if state["timer"] else None
+                kind, act_label = win.idle_activity()
+                expected = island_pill.idle_layout(
+                    kind, act_label, state["charging"], state["timer"],
+                    island_pill.HOUR24)["width"]
+                self.assertEqual(win.idle_w(win.dl_active), expected)
+
+    def test_all_combination_draws(self):
+        """Every combination draws headlessly; the mascot keeps its
+        far-left slot (ink inside the mascot area in every state)."""
+        win = island_pill.Island.__new__(island_pill.Island)
+        for dl in (False, True):
+            for playing in (False, True):
+                for charging in (False, True):
+                    for timer in (False, True):
+                        with self.subTest(dl=dl, playing=playing,
+                                          charging=charging, timer=timer):
+                            win.dl_active = dl
+                            win.dl_name = "File.zip" if dl else ""
+                            win.media_playing = lambda: playing
+                            win.current_player = (lambda: ("s", {"title": "Track"})) \
+                                if playing else (lambda: None)
+                            win.charge_flash = charging
+                            win.charge_phase = 0.4
+                            win.timer_end = time.monotonic() + 300 if timer else None
+                            win.batt_draw_pct = 55
+                            win.batt_pct = 55
+                            win.music_phase = 1.0
+                            win.dl_phase = 0.5
+                            win.dl_bar = lambda: (0.42, (0.35, 0.62, 1.0, 1.0), True)
+                            win.mascot_mood = lambda: "idle"
+                            win.w = float(win.idle_w(win.dl_active))
+                            win.h = float(island_pill.IDLE_H)
+                            surf = cairo.ImageSurface(cairo.FORMAT_ARGB32,
+                                                      island_pill.WIN_W,
+                                                      island_pill.WIN_H)
+                            cr = cairo.Context(surf)
+                            win.draw_idle(cr)
+                            # mascot ink at the far left of the pill
+                            px = (island_pill.WIN_W - win.w) / 2.0
+                            cy = island_pill.TOP_MARGIN + island_pill.IDLE_H / 2.0
+                            area = (px + 16 - island_pill.MASCOT_IDLE_SIZE / 2.0,
+                                    cy - island_pill.MASCOT_IDLE_SIZE * 1.45 / 2.0,
+                                    float(island_pill.MASCOT_IDLE_SIZE),
+                                    island_pill.MASCOT_IDLE_SIZE * 1.45)
+                            data = surf.get_data()
+                            stride = surf.get_stride()
+                            x, y, w, h = (max(0, int(v)) for v in area)
+                            w = min(w, island_pill.WIN_W - x)
+                            h = min(h, island_pill.WIN_H - y)
+                            ink = 0
+                            for py in range(y, y + h):
+                                row = data[py * stride:(py + 1) * stride]
+                                for pxi in range(x, x + w):
+                                    if row[pxi * 4 + 3]:
+                                        ink += 1
+                            self.assertGreater(ink, 40)
+
+
+class TestMascotEyes(unittest.TestCase):
+    """The mascot's eyes follow the pointer, but only while the pointer is
+    inside the visible island rectangle; motion/leave/retract updates
+    queue at most one redraw and only when the rounded offset changes."""
+
+    def setUp(self):
+        self.win = island_pill.Island.__new__(island_pill.Island)
+        self.win.w = 130.0                    # compact pill rect (165, 8, 130, 34)
+        self.win.h = float(island_pill.IDLE_H)
+        self.win._ids = {"open": 0, "close": 0, "peek": 0, "sec": 0, "face": 0}
+        self.draws = []
+        self.win.queue_draw = lambda: self.draws.append(1)
+        self.win.retarget = lambda: None
+
+    def _motion(self, x, y):
+        return self.win.on_motion(None, type("Ev", (), {"x": x, "y": y})())
+
+    def _reset_eyes(self, offset=(1, 0)):
+        px = (island_pill.WIN_W - self.win.w) / 2.0
+        cy = island_pill.TOP_MARGIN + self.win.h / 2.0
+        self.win.mascot_box = (px + 16, cy, float(island_pill.MASCOT_IDLE_SIZE))
+        self.win.mascot_eyes = offset
+        self.draws = []
+
+    def test_motion_inside_moves_toward_pointer(self):
+        self._reset_eyes((0, 0))
+        cx, cy = self.win.mascot_box[0], self.win.mascot_box[1]
+        self._motion(cx + 9, cy)              # right of the mascot centre
+        self.assertGreater(self.win.mascot_eyes[0], 0)
+        self._motion(cx - 9, cy)              # left of the mascot centre
+        self.assertLess(self.win.mascot_eyes[0], 0)
+        self.assertEqual(self.win.mascot_eyes[1], 0)
+
+    def test_motion_outside_visible_rect_resets(self):
+        self._reset_eyes()
+        self._motion(100, 25.0)               # inside the window, left of the pill
+        self.assertEqual(self.win.mascot_eyes, (0, 0))
+        self.assertEqual(self.draws, [1])     # one redraw for the reset
+
+    def test_motion_at_centre_changes_nothing(self):
+        """Exactly at the mascot centre the offset is zero and unchanged:
+        no redraw at all."""
+        self._reset_eyes((0, 0))
+        self._motion(self.win.mascot_box[0], self.win.mascot_box[1])
+        self.assertEqual(self.win.mascot_eyes, (0, 0))
+        self.assertEqual(self.draws, [])
+
+    def test_identical_offset_queues_no_redraw(self):
+        self._reset_eyes((0, 0))
+        self._motion(290, 25.0)               # far right, in-collision... in-rect corner
+        first = list(self.draws)
+        self.assertEqual(len(first), 1)
+        self._motion(260, 25.0)               # still far right, same rounded offset
+        self.assertEqual(len(self.draws), 1)
+
+    def test_leave_resets_once(self):
+        # open card + running retract timer = the leave path that touches
+        # nothing else (no schedules, no extra redraws)
+        self.win.open = True
+        self.win._ids["close"] = 999
+        self.win.peek_on = False
+        self._reset_eyes()
+        self.win.on_leave(None, None)
+        self.assertEqual(self.win.mascot_eyes, (0, 0))
+        self.assertEqual(self.draws, [1])
+        self.win.on_leave(None, None)         # already zero: no redraw
+        self.assertEqual(len(self.draws), 1)
+
+    def test_retract_resets_once(self):
+        self._reset_eyes()
+        island_pill.HOVER_ONLY = True
+        self.win.open = False                  # already closed: set_open no-ops
+        self.win.pending_peek = None
+        self.win.media_playing = lambda: False
+        self.win.batt_state = 0
+        self.win.dl_active = False
+        self.win.peek_on = False
+        self.win.peek = {}
+        self.win.pending_permissions = {}
+        self.win._do_close()
+        self.assertEqual(self.win.mascot_eyes, (0, 0))
+        # two redraws: _do_close's own state-change redraw plus the single
+        # eye-reset redraw (an unchanged offset would have drawn only once)
+        self.assertEqual(self.draws, [1, 1])
+
+    def test_offset_never_exceeds_clamp(self):
+        """Derived bound: whole pixels after rounding of LOOK_LIMIT * size
+        (3.92 at size 56 -> up to 4)."""
+        LOOK_LIMIT = island_pill.LOOK_LIMIT
+        far = [(500, 0), (0, 500), (500, 500), (-500, -500),
+               (106.0, 94.0), (94.0, 106.0)]
+        for size in (22, 24, 26, 48, 56):
+            lim = int(round(LOOK_LIMIT * size))
+            for px, py in far:
+                ox, oy = island_pill.mascot_look(100.0, 100.0, size, px, py)
+                self.assertIsInstance(ox, int)
+                self.assertIsInstance(oy, int)
+                self.assertLessEqual(abs(ox), lim)
+                self.assertLessEqual(abs(oy), lim)
+
+    def test_mascot_look_direction(self):
+        winless = island_pill.mascot_look
+        self.assertEqual(winless(0.0, 0.0, 22.0, 0.0, 0.0), (0, 0))     # centre
+        self.assertEqual(winless(0.0, 0.0, 22.0, 500.0, 500.0), (1, 1))      # down-right
+        self.assertEqual(winless(0.0, 0.0, 22.0, -500.0, 0.0), (-1, 0))      # left
+        self.assertEqual(winless(0.0, 0.0, 48.0, 0.0, 500.0), (0, 3))        # down, 0.07*48=3.36
+
+    def test_draws_record_mascot_box_and_pass_offset(self):
+        """draw_idle / draw_peek / draw_open all record mascot_box and pass
+        the stored offset as eye_dx/eye_dy."""
+        orig = island_pill.draw_mascot
+        calls = []
+
+        def spy(cr, cx, cy, size, mood, eye_dx=0.0, eye_dy=0.0):
+            calls.append((cx, cy, size, mood, eye_dx, eye_dy))
+
+        island_pill.draw_mascot = spy
+        win = self.win
+        win.mascot_eyes = (1, -1)
+        win.mascot_mood = lambda: "idle"
+        win.peek_mood = lambda pk: "idle"
+        try:
+            # compact pill
+            win.dl_active = False
+            win.media_playing = lambda: False
+            win.current_player = lambda: None
+            win.charge_flash = False
+            win.timer_end = None
+            surf = cairo.ImageSurface(cairo.FORMAT_ARGB32,
+                                      island_pill.WIN_W, island_pill.WIN_H)
+            cr = cairo.Context(surf)
+            win.draw_idle(cr)
+            px = (island_pill.WIN_W - win.w) / 2.0
+            cy = island_pill.TOP_MARGIN + island_pill.IDLE_H / 2.0
+            self.assertEqual(calls[-1],
+                             (px + 16, cy, float(island_pill.MASCOT_IDLE_SIZE),
+                              "idle", 1, -1))
+            self.assertEqual(win.mascot_box,
+                             (px + 16, cy, float(island_pill.MASCOT_IDLE_SIZE)))
+            # peek
+            win.peek = {"kind": "notify", "title": "Hello", "body": "Body",
+                        "accent": None, "app": "App"}
+            win.peek_on = True
+            win.hits = []
+            win.draw_peek(cr)
+            ppx = (island_pill.WIN_W - island_pill.PEEK_W) / 2.0
+            pcy = island_pill.TOP_MARGIN + island_pill.PEEK_H / 2.0
+            self.assertEqual(calls[-1],
+                             (ppx + 17, pcy, float(island_pill.MASCOT_PEEK_SIZE),
+                              "idle", 1, -1))
+            self.assertEqual(win.mascot_box,
+                             (ppx + 17, pcy, float(island_pill.MASCOT_PEEK_SIZE)))
+            # open card mascot tile
+            win.open_tab = "Home"
+            win.hits = []
+            win.h = float(island_pill.OPEN_H_BASE)
+            win.dl_phase = 0.5
+            win.dl_rate = 0.0
+            win.dl_name = None
+            win.dl_bytes = 0
+            win.dl_bar = lambda: (0.42, (0.35, 0.62, 1.0, 1.0), True)
+            win.wdev = None
+            win.bt_powered = None
+            win.has_conn = lambda: False
+            win.cpu_pct = None
+            win.mem_used = None
+            win.mem_total = None
+            win.temp_cached = None
+            win.batt_draw_pct = None
+            win.draw_open(cr)
+            ox = (island_pill.WIN_W - island_pill.OPEN_W) / 2.0
+            mx = ox + 6 + island_pill.MASCOT_TILE_W / 2.0
+            my = island_pill.TOP_MARGIN + win.h / 2.0
+            m_size = min(float(island_pill.MASCOT_TILE_SIZE), win.h - 16.0)
+            self.assertEqual(calls[-1], (mx, my, m_size, "idle", 1, -1))
+            self.assertEqual(win.mascot_box, (mx, my, m_size))
+        finally:
+            island_pill.draw_mascot = orig
+
+
+class TestMascotTile(unittest.TestCase):
+    """The open card's mascot tile: a click cycles the face (first click
+    shows done, wrapping back after idle), each click re-arms exactly one
+    4000 ms one-shot timer via the standard _ids pattern, the timeout (only
+    while the card is open) reverts the manual face so the live mood takes
+    over again, set_open(False) is the close-path choke point that cancels
+    the timer and clears the face, and a tile click neither closes the card
+    nor falls through to the card body. Layout: the open hover rect stays
+    OPEN_W wide (WIN_W = OPEN_W + 60) and the card paints ink over the
+    tile area, so the inpaint input shape covers it."""
+
+    def setUp(self):
+        self.win = island_pill.Island.__new__(island_pill.Island)
+        self.win.open = True
+        self.win.open_tab = "Home"
+        self.win.h = float(island_pill.OPEN_H_BASE)
+        self.win.peek_on = False
+        self.win.peek = {}
+        self.win.pending_peek = None
+        self.win.pending_permissions = {}
+        self.win.oc_sessions = {}
+        self.win.last_activity = time.monotonic()
+        self.win.mascot_face = None
+        self.win.mascot_eyes = (0, 0)
+        self.win._ids = {"open": 0, "close": 0, "peek": 0, "sec": 0, "face": 0}
+        self.win.hits = []
+        self.draws = []
+        self.win.queue_draw = lambda: self.draws.append(1)
+        self.win.retarget = lambda: None
+        self.timers = []
+        self.cancelled = []
+        self.orig_once = island_pill.once
+        self.orig_cancel = island_pill.cancel
+        self.orig_draw_mascot = island_pill.draw_mascot
+        island_pill.once = self._fake_once
+        island_pill.cancel = lambda sid: self.cancelled.append(sid)
+
+    def tearDown(self):
+        island_pill.once = self.orig_once
+        island_pill.cancel = self.orig_cancel
+        island_pill.draw_mascot = self.orig_draw_mascot
+
+    def _fake_once(self, ms, fn):
+        self.timers.append((ms, fn))
+        return 900 + len(self.timers)
+
+    def _press_self(self, x, y):
+        """Left click at (x, y) via on_press with a stub event."""
+        ev = type("Ev", (), {"button": 1, "x": x, "y": y})()
+        self.win.on_press(None, ev)
+
+    def test_face_cycle_order(self):
+        """First click shows done, then permission, sleeping, failed, idle,
+        then wraps to done again; every click re-arms exactly one
+        FACE_PEEK_MS timer and cancels the previous one."""
+        expected = ["done", "permission", "sleeping", "failed", "idle", "done"]
+        for i, face in enumerate(expected):
+            self.win.cycle_mascot_face()
+            self.assertEqual(self.win.mascot_face, face)
+            ms, fn = self.timers[-1]
+            self.assertEqual(ms, island_pill.FACE_PEEK_MS)
+            self.assertIs(fn.__self__, self.win)
+            self.assertEqual(fn.__func__, island_pill.Island._face_timeout)
+            self.assertEqual(self.win._ids["face"], 900 + len(self.timers))
+            if i == 0:
+                self.assertEqual(self.cancelled, [])     # nothing to cancel yet
+            else:
+                self.assertEqual(self.cancelled[-1], 900 + i)  # prior timer id
+        self.assertEqual(len(self.timers), len(expected))
+
+    def test_tile_click_keeps_card_open(self):
+        """A tile click (first hit in draw_open) changes the face, keeps
+        the card open, never falls through to a body hit."""
+        self.body_called = []
+        self.win.hits = [(36.0, 8.0, 68.0, 112.0, self.win.cycle_mascot_face),
+                         (170.0, 60.0, 100.0, 30.0,
+                          lambda: self.body_called.append(1))]
+        self.assertNotEqual(self.win.hits[0][4], self.win.hits[1][4])
+        self._press_self(70.0, 50.0)          # inside the tile rect
+        self.assertEqual(self.win.mascot_face, "done")   # first click
+        self.assertEqual(self.body_called, [])           # no fall-through
+        self.assertTrue(self.win.open)                   # card stays open
+        self.assertEqual(self.win._ids["face"], 901)     # timer armed
+
+    def test_face_timeout_reverts_to_live_mood(self):
+        """While the card is open the timeout clears its id, drops the
+        manual face (draw_open falls back to mascot_mood) and repaints."""
+        island_pill.draw_mascot = lambda *a, **k: None
+        self.win.cycle_mascot_face()
+        ms, fn = self.timers[-1]
+        self.assertEqual(fn(), False)
+        self.assertEqual(self.win._ids["face"], 0)
+        self.assertIsNone(self.win.mascot_face)
+        self.assertGreater(len(self.draws), 1)
+
+    def test_face_timeout_nothing_when_closed(self):
+        """Card closed: the stale callback only clears its id, no redraw,
+        no face change (the close path already owned the face)."""
+        self.win.open = False
+        self.win.mascot_face = "sleeping"    # sentinel set before closing
+        self.win._ids["face"] = 901
+        self.win._face_timeout()
+        self.assertEqual(self.win._ids["face"], 0)
+        self.assertEqual(self.win.mascot_face, "sleeping")
+        self.assertEqual(self.draws, [])
+
+    def test_set_open_false_cancels_face(self):
+        """set_open(False) is the choke point every close path goes
+        through (card body click, _do_close, peek replacing the card):
+        it cancels the face timer and clears the face."""
+        self.win.cycle_mascot_face()
+        self.assertEqual(self.win._ids["face"], 901)
+        self.win.set_open(False)
+        self.assertEqual(self.cancelled[-1], 901)
+        self.assertEqual(self.win._ids["face"], 0)
+        self.assertIsNone(self.win.mascot_face)
+
+    def test_do_close_retraction_cancels_face(self):
+        """Retraction (pointer leaving the island) also lands on
+        set_open(False) from _do_close."""
+        self.win.mascot_face = "permission"
+        self.win._ids["face"] = 901
+        self.win._do_close()
+        self.assertEqual(self.cancelled[-1], 901)
+        self.assertIsNone(self.win.mascot_face)
+
+    def test_show_peek_while_open_cancels_face(self):
+        """A peek arriving while the card is open closes the card through
+        set_open(False) which cancels the face timer."""
+        self.win.get_mapped = lambda: False
+        self.win.dl_dir = island_pill.download_dir()
+        self.win.cycle_mascot_face()
+        self.win.show_peek("battery", "Battery low", "20% remaining", secs=6)
+        self.assertFalse(self.win.open)
+        self.assertIsNone(self.win.mascot_face)
+        self.assertEqual(self.cancelled[-1], 901)
+
+    def test_open_hover_rect_width_is_open_w(self):
+        """The hover/input rectangle for the open state is the pill rect:
+        OPEN_W wide and centred in the extended window."""
+        self.assertEqual(island_pill.WIN_W, island_pill.OPEN_W + 60)
+        self.win.w = float(island_pill.OPEN_W)
+        rect = self.win.pill_rect()
+        self.assertEqual(rect,
+                         ((island_pill.WIN_W - island_pill.OPEN_W) / 2.0,
+                          island_pill.TOP_MARGIN, float(island_pill.OPEN_W),
+                          float(island_pill.OPEN_H_BASE)))
+
+    def test_shape_covers_tile(self):
+        """draw_open paints ink across the tile area, so the inpaint input
+        shape (built from the same paint) covers it. Sampling avoids the
+        rounded corner pixels anyway."""
+        self.win.current_player = lambda: None
+        self.win.media_playing = lambda: False
+        self.win.mascot_face = "idle"
+        self.win.dl_active = False
+        self.win.dl_phase = 0.5
+        self.win.dl_rate = 0.0
+        self.win.dl_name = None
+        self.win.dl_bytes = 0
+        self.win.dl_bar = lambda: (0.42, (0.35, 0.62, 1.0, 1.0), True)
+        self.win.wdev = None
+        self.win.bt_powered = None
+        self.win.has_conn = lambda: False
+        self.win.cpu_pct = None
+        self.win.mem_used = None
+        self.win.mem_total = None
+        self.win.temp_cached = None
+        self.win.batt_pct = None
+        self.win.batt_state = 0
+        self.win.batt_draw_pct = None
+        self.win.charge_flash = False
+        self.win.charge_phase = 0.0
+        self.win.timer_end = None
+        surf = cairo.ImageSurface(cairo.FORMAT_ARGB32,
+                                  island_pill.WIN_W, island_pill.WIN_H)
+        cr = cairo.Context(surf)
+        self.win.draw_open(cr)
+        data = surf.get_data()
+        stride = surf.get_stride()
+        ox = (island_pill.WIN_W - island_pill.OPEN_W) / 2.0
+        x0, y0 = int(ox + 8), island_pill.TOP_MARGIN + 4
+        ink = 0
+        for y in range(y0, y0 + int(self.win.h) - 8, 2):
+            row = data[y * stride:(y + 1) * stride]
+            for x in range(x0, x0 + island_pill.MASCOT_TILE_W - 4, 2):
+                if row[x * 4 + 3]:
+                    ink += 1
+        # tile background plus the mascot: plenty of alpha pixels
+        self.assertGreater(ink, 200)
+        # the tile hit is the first hit draw_open reported
+        self.assertEqual(self.win.hits[0],
+                         (ox + 6, island_pill.TOP_MARGIN,
+                          island_pill.MASCOT_TILE_W, self.win.h,
+                          self.win.cycle_mascot_face))
 
 
 if __name__ == "__main__":
