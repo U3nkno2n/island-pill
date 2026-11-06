@@ -165,7 +165,7 @@ class TestShowPeekHoverOnly(unittest.TestCase):
         self.win.peek_on = False
         self.win.peek = {}
         self.win.pending_peek = None
-        self.win._ids = {"open": 0, "close": 0, "peek": 0, "sec": 0}
+        self.win._ids = {"open": 0, "close": 0, "peek": 0, "sec": 0, "face": 0}
         self.win.dl_dir = island_pill.download_dir()
         self.win.retarget = lambda: None
         self.win.queue_draw = lambda: None
@@ -245,7 +245,7 @@ class TestPendingPeekPromotion(unittest.TestCase):
             "accent": island_pill.GREEN,
             "app": "",
         }
-        self.win._ids = {"open": 0, "close": 0, "peek": 0, "sec": 0}
+        self.win._ids = {"open": 0, "close": 0, "peek": 0, "sec": 0, "face": 0}
         self.win.dl_dir = island_pill.download_dir()
         self.win.retarget = lambda: None
         self.win.queue_draw = lambda: None
@@ -519,7 +519,7 @@ class TestOpenCodePermissionHandling(unittest.TestCase):
         self.win.peek = {}
         self.win.pending_peek = None
         self.win.pending_permissions = {}
-        self.win._ids = {"open": 0, "close": 0, "peek": 0, "sec": 0}
+        self.win._ids = {"open": 0, "close": 0, "peek": 0, "sec": 0, "face": 0}
         self.win.dl_dir = island_pill.download_dir()
         self.win.retarget = lambda: None
         self.win.queue_draw = lambda: None
@@ -647,7 +647,7 @@ class TestClickExpandAndPeeks(unittest.TestCase):
         self.win.peek = {}
         self.win.pending_peek = None
         self.win.pending_permissions = {}
-        self.win._ids = {"open": 0, "close": 0, "peek": 0, "sec": 0}
+        self.win._ids = {"open": 0, "close": 0, "peek": 0, "sec": 0, "face": 0}
         self.win.dl_dir = island_pill.download_dir()
         self.win.retarget = lambda: None
         self.win.queue_draw = lambda: None
@@ -802,7 +802,7 @@ class TestOpenCodeSessionRows(unittest.TestCase):
         self.win.peek = {}
         self.win.pending_peek = None
         self.win.pending_permissions = {}
-        self.win._ids = {"open": 0, "close": 0, "peek": 0, "sec": 0}
+        self.win._ids = {"open": 0, "close": 0, "peek": 0, "sec": 0, "face": 0}
         self.win.dl_dir = island_pill.download_dir()
         self.win.retarget = lambda: None
         self.win.queue_draw = lambda: None
@@ -960,6 +960,7 @@ class TestOpenTabsHeadless(unittest.TestCase):
         self.win = island_pill.Island.__new__(island_pill.Island)
         self.win.open_tab = "Home"
         self.win.hits = []
+        self.win.h = float(island_pill.OPEN_H_BASE)   # draw_open's animated height
         self.win.oc_sessions = {}
         self.win.current_player = lambda: None
         self.win.cpu_pct = None
@@ -1010,6 +1011,7 @@ class TestOpenTilesHeadless(unittest.TestCase):
         self.win = island_pill.Island.__new__(island_pill.Island)
         self.win.open_tab = "Home"
         self.win.hits = []
+        self.win.h = float(island_pill.OPEN_H_BASE)   # draw_open's animated height
         self.win.current_player = lambda: None
         self.win.timer_end = None
         self.win.dl_phase = 0.5
@@ -1084,8 +1086,9 @@ class TestOpenSystemStatesHeadless(unittest.TestCase):
 
     def setUp(self):
         self.win = island_pill.Island.__new__(island_pill.Island)
-        self.win.open_tab = "System"
+        self.win.open_tab = "Home"
         self.win.hits = []
+        self.win.h = float(island_pill.OPEN_H_BASE)   # draw_open's animated height
         self.win.current_player = lambda: None
         self.win.cpu_pct = None
         self.win.mem_used = None
@@ -1129,6 +1132,7 @@ class TestOpenSessionsHeadless(unittest.TestCase):
         self.win = island_pill.Island.__new__(island_pill.Island)
         self.win.open_tab = "OpenCode"
         self.win.hits = []
+        self.win.h = float(island_pill.OPEN_H_BASE)   # draw_open's animated height
         self.win.oc_sessions = {}
         self.win.current_player = lambda: None
         self.win.queue_draw = lambda: None
@@ -1371,7 +1375,7 @@ class TestMascotActivity(unittest.TestCase):
         self.win.peek = {}
         self.win.pending_peek = None
         self.win.pending_permissions = {}
-        self.win._ids = {"open": 0, "close": 0, "peek": 0, "sec": 0}
+        self.win._ids = {"open": 0, "close": 0, "peek": 0, "sec": 0, "face": 0}
         self.win.dl_dir = island_pill.download_dir()
         self.win.retarget = lambda: None
         self.win.queue_draw = lambda: None
@@ -1392,7 +1396,7 @@ class TestMascotActivity(unittest.TestCase):
             self.win.peek = {}
             self.win.pending_peek = None
             self.win.pending_permissions = {}
-            self.win._ids = {"open": 0, "close": 0, "peek": 0, "sec": 0}
+            self.win._ids = {"open": 0, "close": 0, "peek": 0, "sec": 0, "face": 0}
             self.win.dl_dir = island_pill.download_dir()
             self.win.retarget = lambda: None
             self.win.queue_draw = lambda: None
@@ -1430,7 +1434,7 @@ class TestMascotActivity(unittest.TestCase):
         win = self.win
         win.timer_mins = 0
         win.timer_end = None
-        win._ids = {"open": 0, "close": 0, "peek": 0, "sec": 0}
+        win._ids = {"open": 0, "close": 0, "peek": 0, "sec": 0, "face": 0}
         win.ensure_sec = lambda: None
         win.retarget = lambda: None
         win.start_timer(5)
@@ -1467,6 +1471,7 @@ class TestMascotDraws(unittest.TestCase):
         self.win = island_pill.Island.__new__(island_pill.Island)
         self.win.open_tab = "Home"
         self.win.hits = []
+        self.win.h = float(island_pill.OPEN_H_BASE)   # draw_open's animated height
         self.win.pending_permissions = {}
         self.win.oc_sessions = {}
         self.win.last_activity = time.monotonic()
@@ -1623,7 +1628,8 @@ class TestMascotDraws(unittest.TestCase):
 
     def test_open_card_all_tabs_all_moods(self):
         ox = (island_pill.WIN_W - island_pill.OPEN_W) / 2.0
-        cy = island_pill.TOP_MARGIN + island_pill.TAB_ROW_H / 2.0
+        m_cy = island_pill.TOP_MARGIN + self.win.h / 2.0
+        m_size = min(float(island_pill.MASCOT_TILE_SIZE), self.win.h - 16.0)
         for tab in ("Home", "OpenCode", "System"):
             for mood in self.MOODS:
                 with self.subTest(tab=tab, mood=mood):
@@ -1632,11 +1638,17 @@ class TestMascotDraws(unittest.TestCase):
                     self.win.hits = []
                     surf, cr = self._surface()
                     self.win.draw_open(cr)
-                    area = self._mascot_area(ox + 32, cy, island_pill.MASCOT_CARD_SIZE)
+                    area = self._mascot_area(ox + 40, m_cy, m_size)
                     self.assertGreater(self._ink(surf, area), 40)
-                    self.assertGreaterEqual(len(self.win.hits), 3)  # three tab pills
+                    # the mascot tile plus the three tab pills (and any
+                    # content hits) - the tile hit contains the mascot
+                    self.assertGreaterEqual(len(self.win.hits), 4)
                     for hx, hy, hw, hh, _fn in self.win.hits:
-                        self.assertFalse(self._overlaps((hx, hy, hw, hh), area))
+                        contains = (hx <= area[0] and hy <= area[1]
+                                    and hx + hw >= area[0] + area[2]
+                                    and hy + hh >= area[1] + area[3])
+                        if not contains:
+                            self.assertFalse(self._overlaps((hx, hy, hw, hh), area))
 
     def test_idle_w_reserves_mascot_segment(self):
         """With a long enough activity label (past the 112 min clamp) the
@@ -1810,7 +1822,7 @@ class TestMascotEyes(unittest.TestCase):
         self.win = island_pill.Island.__new__(island_pill.Island)
         self.win.w = 130.0                    # compact pill rect (165, 8, 130, 34)
         self.win.h = float(island_pill.IDLE_H)
-        self.win._ids = {"open": 0, "close": 0, "peek": 0, "sec": 0}
+        self.win._ids = {"open": 0, "close": 0, "peek": 0, "sec": 0, "face": 0}
         self.draws = []
         self.win.queue_draw = lambda: self.draws.append(1)
         self.win.retarget = lambda: None
@@ -1819,15 +1831,18 @@ class TestMascotEyes(unittest.TestCase):
         return self.win.on_motion(None, type("Ev", (), {"x": x, "y": y})())
 
     def _reset_eyes(self, offset=(1, 0)):
-        self.win.mascot_box = (181.0, 25.0, float(island_pill.MASCOT_IDLE_SIZE))
+        px = (island_pill.WIN_W - self.win.w) / 2.0
+        cy = island_pill.TOP_MARGIN + self.win.h / 2.0
+        self.win.mascot_box = (px + 16, cy, float(island_pill.MASCOT_IDLE_SIZE))
         self.win.mascot_eyes = offset
         self.draws = []
 
     def test_motion_inside_moves_toward_pointer(self):
         self._reset_eyes((0, 0))
-        self._motion(190, 25.0)               # right of the mascot centre
+        cx, cy = self.win.mascot_box[0], self.win.mascot_box[1]
+        self._motion(cx + 9, cy)              # right of the mascot centre
         self.assertGreater(self.win.mascot_eyes[0], 0)
-        self._motion(170, 25.0)               # left of the mascot centre
+        self._motion(cx - 9, cy)              # left of the mascot centre
         self.assertLess(self.win.mascot_eyes[0], 0)
         self.assertEqual(self.win.mascot_eyes[1], 0)
 
@@ -1841,7 +1856,7 @@ class TestMascotEyes(unittest.TestCase):
         """Exactly at the mascot centre the offset is zero and unchanged:
         no redraw at all."""
         self._reset_eyes((0, 0))
-        self._motion(181.0, 25.0)
+        self._motion(self.win.mascot_box[0], self.win.mascot_box[1])
         self.assertEqual(self.win.mascot_eyes, (0, 0))
         self.assertEqual(self.draws, [])
 
@@ -1884,11 +1899,13 @@ class TestMascotEyes(unittest.TestCase):
         self.assertEqual(self.draws, [1, 1])
 
     def test_offset_never_exceeds_clamp(self):
+        """Derived bound: whole pixels after rounding of LOOK_LIMIT * size
+        (3.92 at size 56 -> up to 4)."""
         LOOK_LIMIT = island_pill.LOOK_LIMIT
         far = [(500, 0), (0, 500), (500, 500), (-500, -500),
                (106.0, 94.0), (94.0, 106.0)]
-        for size in (22, 24, 26, 48):
-            lim = int(LOOK_LIMIT * size)
+        for size in (22, 24, 26, 48, 56):
+            lim = int(round(LOOK_LIMIT * size))
             for px, py in far:
                 ox, oy = island_pill.mascot_look(100.0, 100.0, size, px, py)
                 self.assertIsInstance(ox, int)
@@ -1948,9 +1965,10 @@ class TestMascotEyes(unittest.TestCase):
                               "idle", 1, -1))
             self.assertEqual(win.mascot_box,
                              (ppx + 17, pcy, float(island_pill.MASCOT_PEEK_SIZE)))
-            # open card tab row
+            # open card mascot tile
             win.open_tab = "Home"
             win.hits = []
+            win.h = float(island_pill.OPEN_H_BASE)
             win.dl_phase = 0.5
             win.dl_rate = 0.0
             win.dl_name = None
@@ -1966,14 +1984,210 @@ class TestMascotEyes(unittest.TestCase):
             win.batt_draw_pct = None
             win.draw_open(cr)
             ox = (island_pill.WIN_W - island_pill.OPEN_W) / 2.0
-            ocy = island_pill.TOP_MARGIN + island_pill.TAB_ROW_H / 2.0
-            self.assertEqual(calls[-1],
-                             (ox + 32, ocy, float(island_pill.MASCOT_CARD_SIZE),
-                              "idle", 1, -1))
-            self.assertEqual(win.mascot_box,
-                             (ox + 32, ocy, float(island_pill.MASCOT_CARD_SIZE)))
+            mx = ox + 6 + island_pill.MASCOT_TILE_W / 2.0
+            my = island_pill.TOP_MARGIN + win.h / 2.0
+            m_size = min(float(island_pill.MASCOT_TILE_SIZE), win.h - 16.0)
+            self.assertEqual(calls[-1], (mx, my, m_size, "idle", 1, -1))
+            self.assertEqual(win.mascot_box, (mx, my, m_size))
         finally:
             island_pill.draw_mascot = orig
+
+
+class TestMascotTile(unittest.TestCase):
+    """The open card's mascot tile: a click cycles the face (first click
+    shows done, wrapping back after idle), each click re-arms exactly one
+    4000 ms one-shot timer via the standard _ids pattern, the timeout (only
+    while the card is open) reverts the manual face so the live mood takes
+    over again, set_open(False) is the close-path choke point that cancels
+    the timer and clears the face, and a tile click neither closes the card
+    nor falls through to the card body. Layout: the open hover rect stays
+    OPEN_W wide (WIN_W = OPEN_W + 60) and the card paints ink over the
+    tile area, so the inpaint input shape covers it."""
+
+    def setUp(self):
+        self.win = island_pill.Island.__new__(island_pill.Island)
+        self.win.open = True
+        self.win.open_tab = "Home"
+        self.win.h = float(island_pill.OPEN_H_BASE)
+        self.win.peek_on = False
+        self.win.peek = {}
+        self.win.pending_peek = None
+        self.win.pending_permissions = {}
+        self.win.oc_sessions = {}
+        self.win.last_activity = time.monotonic()
+        self.win.mascot_face = None
+        self.win.mascot_eyes = (0, 0)
+        self.win._ids = {"open": 0, "close": 0, "peek": 0, "sec": 0, "face": 0}
+        self.win.hits = []
+        self.draws = []
+        self.win.queue_draw = lambda: self.draws.append(1)
+        self.win.retarget = lambda: None
+        self.timers = []
+        self.cancelled = []
+        self.orig_once = island_pill.once
+        self.orig_cancel = island_pill.cancel
+        self.orig_draw_mascot = island_pill.draw_mascot
+        island_pill.once = self._fake_once
+        island_pill.cancel = lambda sid: self.cancelled.append(sid)
+
+    def tearDown(self):
+        island_pill.once = self.orig_once
+        island_pill.cancel = self.orig_cancel
+        island_pill.draw_mascot = self.orig_draw_mascot
+
+    def _fake_once(self, ms, fn):
+        self.timers.append((ms, fn))
+        return 900 + len(self.timers)
+
+    def _press_self(self, x, y):
+        """Left click at (x, y) via on_press with a stub event."""
+        ev = type("Ev", (), {"button": 1, "x": x, "y": y})()
+        self.win.on_press(None, ev)
+
+    def test_face_cycle_order(self):
+        """First click shows done, then permission, sleeping, failed, idle,
+        then wraps to done again; every click re-arms exactly one
+        FACE_PEEK_MS timer and cancels the previous one."""
+        expected = ["done", "permission", "sleeping", "failed", "idle", "done"]
+        for i, face in enumerate(expected):
+            self.win.cycle_mascot_face()
+            self.assertEqual(self.win.mascot_face, face)
+            ms, fn = self.timers[-1]
+            self.assertEqual(ms, island_pill.FACE_PEEK_MS)
+            self.assertIs(fn.__self__, self.win)
+            self.assertEqual(fn.__func__, island_pill.Island._face_timeout)
+            self.assertEqual(self.win._ids["face"], 900 + len(self.timers))
+            if i == 0:
+                self.assertEqual(self.cancelled, [])     # nothing to cancel yet
+            else:
+                self.assertEqual(self.cancelled[-1], 900 + i)  # prior timer id
+        self.assertEqual(len(self.timers), len(expected))
+
+    def test_tile_click_keeps_card_open(self):
+        """A tile click (first hit in draw_open) changes the face, keeps
+        the card open, never falls through to a body hit."""
+        self.body_called = []
+        self.win.hits = [(36.0, 8.0, 68.0, 112.0, self.win.cycle_mascot_face),
+                         (170.0, 60.0, 100.0, 30.0,
+                          lambda: self.body_called.append(1))]
+        self.assertNotEqual(self.win.hits[0][4], self.win.hits[1][4])
+        self._press_self(70.0, 50.0)          # inside the tile rect
+        self.assertEqual(self.win.mascot_face, "done")   # first click
+        self.assertEqual(self.body_called, [])           # no fall-through
+        self.assertTrue(self.win.open)                   # card stays open
+        self.assertEqual(self.win._ids["face"], 901)     # timer armed
+
+    def test_face_timeout_reverts_to_live_mood(self):
+        """While the card is open the timeout clears its id, drops the
+        manual face (draw_open falls back to mascot_mood) and repaints."""
+        island_pill.draw_mascot = lambda *a, **k: None
+        self.win.cycle_mascot_face()
+        ms, fn = self.timers[-1]
+        self.assertEqual(fn(), False)
+        self.assertEqual(self.win._ids["face"], 0)
+        self.assertIsNone(self.win.mascot_face)
+        self.assertGreater(len(self.draws), 1)
+
+    def test_face_timeout_nothing_when_closed(self):
+        """Card closed: the stale callback only clears its id, no redraw,
+        no face change (the close path already owned the face)."""
+        self.win.open = False
+        self.win.mascot_face = "sleeping"    # sentinel set before closing
+        self.win._ids["face"] = 901
+        self.win._face_timeout()
+        self.assertEqual(self.win._ids["face"], 0)
+        self.assertEqual(self.win.mascot_face, "sleeping")
+        self.assertEqual(self.draws, [])
+
+    def test_set_open_false_cancels_face(self):
+        """set_open(False) is the choke point every close path goes
+        through (card body click, _do_close, peek replacing the card):
+        it cancels the face timer and clears the face."""
+        self.win.cycle_mascot_face()
+        self.assertEqual(self.win._ids["face"], 901)
+        self.win.set_open(False)
+        self.assertEqual(self.cancelled[-1], 901)
+        self.assertEqual(self.win._ids["face"], 0)
+        self.assertIsNone(self.win.mascot_face)
+
+    def test_do_close_retraction_cancels_face(self):
+        """Retraction (pointer leaving the island) also lands on
+        set_open(False) from _do_close."""
+        self.win.mascot_face = "permission"
+        self.win._ids["face"] = 901
+        self.win._do_close()
+        self.assertEqual(self.cancelled[-1], 901)
+        self.assertIsNone(self.win.mascot_face)
+
+    def test_show_peek_while_open_cancels_face(self):
+        """A peek arriving while the card is open closes the card through
+        set_open(False) which cancels the face timer."""
+        self.win.get_mapped = lambda: False
+        self.win.dl_dir = island_pill.download_dir()
+        self.win.cycle_mascot_face()
+        self.win.show_peek("battery", "Battery low", "20% remaining", secs=6)
+        self.assertFalse(self.win.open)
+        self.assertIsNone(self.win.mascot_face)
+        self.assertEqual(self.cancelled[-1], 901)
+
+    def test_open_hover_rect_width_is_open_w(self):
+        """The hover/input rectangle for the open state is the pill rect:
+        OPEN_W wide and centred in the extended window."""
+        self.assertEqual(island_pill.WIN_W, island_pill.OPEN_W + 60)
+        self.win.w = float(island_pill.OPEN_W)
+        rect = self.win.pill_rect()
+        self.assertEqual(rect,
+                         ((island_pill.WIN_W - island_pill.OPEN_W) / 2.0,
+                          island_pill.TOP_MARGIN, float(island_pill.OPEN_W),
+                          float(island_pill.OPEN_H_BASE)))
+
+    def test_shape_covers_tile(self):
+        """draw_open paints ink across the tile area, so the inpaint input
+        shape (built from the same paint) covers it. Sampling avoids the
+        rounded corner pixels anyway."""
+        self.win.current_player = lambda: None
+        self.win.media_playing = lambda: False
+        self.win.mascot_face = "idle"
+        self.win.dl_active = False
+        self.win.dl_phase = 0.5
+        self.win.dl_rate = 0.0
+        self.win.dl_name = None
+        self.win.dl_bytes = 0
+        self.win.dl_bar = lambda: (0.42, (0.35, 0.62, 1.0, 1.0), True)
+        self.win.wdev = None
+        self.win.bt_powered = None
+        self.win.has_conn = lambda: False
+        self.win.cpu_pct = None
+        self.win.mem_used = None
+        self.win.mem_total = None
+        self.win.temp_cached = None
+        self.win.batt_pct = None
+        self.win.batt_state = 0
+        self.win.batt_draw_pct = None
+        self.win.charge_flash = False
+        self.win.charge_phase = 0.0
+        self.win.timer_end = None
+        surf = cairo.ImageSurface(cairo.FORMAT_ARGB32,
+                                  island_pill.WIN_W, island_pill.WIN_H)
+        cr = cairo.Context(surf)
+        self.win.draw_open(cr)
+        data = surf.get_data()
+        stride = surf.get_stride()
+        ox = (island_pill.WIN_W - island_pill.OPEN_W) / 2.0
+        x0, y0 = int(ox + 8), island_pill.TOP_MARGIN + 4
+        ink = 0
+        for y in range(y0, y0 + int(self.win.h) - 8, 2):
+            row = data[y * stride:(y + 1) * stride]
+            for x in range(x0, x0 + island_pill.MASCOT_TILE_W - 4, 2):
+                if row[x * 4 + 3]:
+                    ink += 1
+        # tile background plus the mascot: plenty of alpha pixels
+        self.assertGreater(ink, 200)
+        # the tile hit is the first hit draw_open reported
+        self.assertEqual(self.win.hits[0],
+                         (ox + 6, island_pill.TOP_MARGIN,
+                          island_pill.MASCOT_TILE_W, self.win.h,
+                          self.win.cycle_mascot_face))
 
 
 if __name__ == "__main__":

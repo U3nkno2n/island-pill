@@ -82,7 +82,7 @@ EAR = 12                         # radius of the flared top corners (notch style
 IDLE_H = 30 if NOTCH else 34
 DL_EXTRA = 6                     # extra idle height while the download bar is showing (px)
 PEEK_W, PEEK_H = 360, 58
-OPEN_W = 400
+OPEN_W = 468                     # card content + the 68 px mascot tile
 TAB_ROW_H = 36                   # tab row at the top of the open card
 HOME_GAP = 8                     # gap between stacked cards on Home
 HOME_CARD_PAD = 12               # inner padding inside every Home card
@@ -127,8 +127,11 @@ OC_ROW_COLOR = {"working": BLUE, "approval": ORANGE, "done": GREEN, "failed": OR
 # timing table (no timers: the mood is recomputed at draw time).
 MASCOT_IDLE_SIZE = 22              # compact pill, left of the clock / activity text
 MASCOT_PEEK_SIZE = 26              # peeks, left of the peek text
-MASCOT_CARD_SIZE = 24              # open card, left end of the tab row
 MASCOT_IDLE_W = 34                 # compact pill: mascot plus breathing room
+MASCOT_TILE_W = 68                 # open card: mascot tile, 56 px mascot + margins
+MASCOT_TILE_SIZE = 56              # mascot inside the tile (shrinks to fit)
+MASCOT_TILE_FACES = ("idle", "done", "permission", "sleeping", "failed")
+FACE_PEEK_MS = 4000                # manual face reverts to the live mood after this
 OC_MOOD_FAILED_S = 10.0            # a Failed row keeps the failed mood this long
 OC_MOOD_DONE_S = 4.0               # a Done row keeps the done mood this long
 MASCOT_SLEEP_AFTER = 300.0         # this much quiet puts the mascot to sleep
@@ -339,7 +342,7 @@ class Island(Gtk.Window):
         self.temp_cached = None   # Celsius, cached once per second while open
         self.temp_file = find_temp_file()
         self.last_notif = ("", 0.0)
-        self._ids = {"open": 0, "close": 0, "peek": 0, "sec": 0}
+        self._ids = {"open": 0, "close": 0, "peek": 0, "sec": 0, "face": 0}
         self.pending_peek = None      # peek queued while the expanded card is open
         self.bus = None
         self.upower = None
@@ -392,6 +395,7 @@ class Island(Gtk.Window):
         # whole-pixel look offset, both window coordinates; no timers.
         self.mascot_box = None
         self.mascot_eyes = (0, 0)
+        self.mascot_face = None   # manual tile face; None = live mood
 
         # geometry (animated)
         initial_w, initial_h = self.target()
@@ -591,6 +595,8 @@ class Island(Gtk.Window):
             self.ensure_sec()
         else:
             self.hits = []
+            self._cancel("face")        # every close path: card gone
+            self.mascot_face = None     # the manual face goes with it
             pending = self.pending_peek
             self.pending_peek = None
             if pending:
@@ -716,6 +722,26 @@ class Island(Gtk.Window):
             self._set_mascot_eyes(0, 0)     # outside the visible island
             return False
         self._set_mascot_eyes(*mascot_look(cx, cy, size, ev.x, ev.y))
+        return False
+
+    # ---- open-card mascot tile: click cycles the face, one one-shot timer
+    # (the standard _ids pattern) reverts to the live mood while open
+    def cycle_mascot_face(self):
+        faces = MASCOT_TILE_FACES
+        if self.mascot_face is None:
+            self.mascot_face = faces[1]     # first click: done
+        else:
+            self.mascot_face = faces[(faces.index(self.mascot_face) + 1) % len(faces)]
+        self._cancel("face")
+        self._ids["face"] = once(FACE_PEEK_MS, self._face_timeout)
+        self.queue_draw()
+
+    def _face_timeout(self):
+        self._ids["face"] = 0
+        if not self.open:
+            return False            # card closed: cleanup happened at close
+        self.mascot_face = None     # back to the live mood
+        self.queue_draw()
         return False
 
     def on_press(self, widget, ev):
@@ -1754,21 +1780,29 @@ class Island(Gtk.Window):
     def draw_open(self, cr):
         self.hits = []
         ox, oy = (WIN_W - OPEN_W) / 2.0, float(TOP_MARGIN)
-        left, right = ox + 22, ox + OPEN_W - 22
+        left, right = ox + 90, ox + OPEN_W - 22   # content clears the mascot tile
         cur = self.current_player()
+        tile_h = float(self.h)                     # animated card height, follows each tab
 
-        # Tab row: the mascot sits at the left end, showing the island's
-        # mood (recomputed at draw time) and tracking the pointer; the tab
-        # pills shift right to clear it and the hits follow the pills.
+        # Mascot tile: spans the full current card height (tab row included),
+        # centred mascot inside; a click cycles the manual face.
+        m_size = min(float(MASCOT_TILE_SIZE), tile_h - 16.0)
+        m_cx, m_cy = ox + 6 + MASCOT_TILE_W / 2.0, oy + tile_h / 2.0
+        card(cr, ox + 6, oy, MASCOT_TILE_W, tile_h)
+        self.hits.append((ox + 6, oy, MASCOT_TILE_W, tile_h,
+                          self.cycle_mascot_face))
         edx, edy = getattr(self, "mascot_eyes", (0, 0))
-        self.mascot_box = (left + 10, oy + TAB_ROW_H / 2.0, float(MASCOT_CARD_SIZE))
-        draw_mascot(cr, left + 10, oy + TAB_ROW_H / 2.0, MASCOT_CARD_SIZE,
-                    self.mascot_mood(), edx, edy)
+        self.mascot_box = (m_cx, m_cy, m_size)
+        draw_mascot(cr, m_cx, m_cy, m_size,
+                    getattr(self, "mascot_face", None) or self.mascot_mood(),
+                    edx, edy)
+
+        # Tab row: Home, OpenCode, System (right of the tile)
         ty = oy + 8
         th = 28
         gap = 8
-        tw = (right - (left + 30) - 2 * gap) / 3.0
-        tx = left + 30
+        tw = (right - left - 2 * gap) / 3.0
+        tx = left
         for label in ("Home", "OpenCode", "System"):
             active = self.open_tab == label
             tab_pill(cr, tx, ty, tw, th, label, active)
