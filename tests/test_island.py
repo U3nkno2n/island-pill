@@ -8,6 +8,8 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
+import io
 
 import cairo  # noqa: E402
 
@@ -18,7 +20,7 @@ os.environ.setdefault("DISPLAY", "")
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import island_pill  # noqa: E402
-from gi.repository import GLib  # noqa: E402
+from gi.repository import GLib, Gio  # noqa: E402
 
 
 class TestFormatters(unittest.TestCase):
@@ -2188,6 +2190,450 @@ class TestMascotTile(unittest.TestCase):
                          (ox + 6, island_pill.TOP_MARGIN,
                           island_pill.MASCOT_TILE_W, self.win.h,
                           self.win.cycle_mascot_face))
+
+
+class TestDoNotDisturb(unittest.TestCase):
+    """The DND tile flips an in-memory-only state; show_peek's single gate
+    drops every normal peek (never shown, never queued) while permission
+    asks (opencode-alert) and the timer-done alert always pass through.
+    Toggling off lets normal peeks flow again."""
+
+    def setUp(self):
+        self.win = island_pill.Island.__new__(island_pill.Island)
+        self.win.open = False
+        self.win.peek_on = False
+        self.win.peek = {}
+        self.win.pending_peek = None
+        self.win.dnd = False
+        self.win._ids = {"open": 0, "close": 0, "peek": 0, "sec": 0, "face": 0}
+        self.win.dl_dir = island_pill.download_dir()
+        self.win.hits = []
+        self.win.retarget = lambda: None
+        self.draws = []
+        self.win.queue_draw = lambda: self.draws.append(1)
+        self.win.get_mapped = lambda: False
+        patcher = mock.patch.object(island_pill, "once", lambda ms, fn: 999)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        patcher = mock.patch.object(island_pill, "cancel", lambda sid: None)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _normal_kinds(self):
+        return ["notify", "battery", "wifi", "bt", "download", "opencode",
+                "opencode-error"]
+
+    def test_dnd_drops_normal_peeks(self):
+        """Closed card, DND on: every normal kind is silently dropped - no
+        peek content, no timer, no repaint."""
+        self.win.dnd = True
+        for kind in self._normal_kinds():
+            with self.subTest(kind=kind):
+                self.win.peek = {}
+                self.win.peek_on = False
+                self.draws = []
+                self.win.show_peek(kind, "T", "b")
+                self.assertEqual(self.win.peek, {})
+                self.assertFalse(self.win.peek_on)
+                self.assertEqual(self.win._ids["peek"], 0)
+                self.assertEqual(self.draws, [])
+
+    def test_dnd_drops_pending_peek_too(self):
+        """Open card, DND on: a normal peek is not even queued as the
+        pending reveal payload (the close path would replay it)."""
+        self.win.open = True
+        self.win.dnd = True
+        self.win.show_peek("battery", "Battery low", "20%")
+        self.assertIsNone(self.win.pending_peek)
+        self.assertTrue(self.win.open)      # gate first: no close, no replay
+
+    def test_dnd_never_drops_permission_or_timer(self):
+        """opencode-alert (permission asks) and timer show with the card
+        closed; with the card open the pending payload is parked so the
+        close path replays it when the card shrinks."""
+        for kind in ("opencode-alert", "timer"):
+            with self.subTest(kind=kind):
+                self.win.open = False
+                self.win.dnd = True
+                self.win.show_peek(kind, "T", "b")
+                self.assertTrue(self.win.peek_on)
+                self.assertEqual(self.win.peek["kind"], kind)
+                # fresh open-card state for the open variant
+                self.win.open = True
+                self.win.pending_peek = None
+                self.win.hits = []
+                self.win.dnd = True
+                self.win.show_peek(kind, "T", "b")
+                # set_open(False) replays the parked payload in the same
+                # call: the peek is showing again right away
+                self.assertTrue(self.win.peek_on)
+                self.assertEqual(self.win.peek["kind"], kind)
+                self.assertIsNone(self.win.pending_peek)
+
+    def test_toggle_off_restores_normal_peeks(self):
+        self.win.dnd = True
+        self.win.show_peek("battery", "X", "b")
+        self.assertEqual(self.win.peek, {})     # silenced
+        self.win.dnd_toggle()
+        self.assertFalse(self.win.dnd)
+        self.win.show_peek("battery", "Battery low", "20%")
+        self.assertTrue(self.win.peek_on)
+        self.assertEqual(self.win.peek["kind"], "battery")
+        self.assertEqual(self.win._ids["peek"], 999)
+
+    def test_dnd_resets_on_restart(self):
+        """Never persisted: DND lives only as an instance attribute set in
+        __init__, so a fresh island (restart) starts with it off."""
+        src = open(island_pill.__file__).read()
+        self.assertIn("memory-only, never persisted", src)
+        for line in src.splitlines():
+            if "dnd" in line:
+                self.assertIsInstance(line, str)  # never touches disk/env/json
+                self.assertFalse(line.strip().startswith("dnd = json")
+                                 or "MONITOR_DIR" in line
+                                 or "os.environ" in line)
+
+
+def _source_of_island_pill():
+    return open(island_pill.__file__, "r").read()
+
+
+class TestHomeTileRow(unittest.TestCase):
+    """Home row layout: DND and Keep Awake are fixed 40x40 icon-only
+    squares at the right end; Wi-Fi/Bluetooth share the rest (126 each when
+    both exist, 260 alone) and the row exists even with no hardware.
+    left = ox + 90, span = right - left = 356, y = MUSIC_CARD_H + HOME_GAP."""
+
+    def setUp(self):
+        self.win = island_pill.Island.__new__(island_pill.Island)
+        self.win.open_tab = "Home"
+        self.win.hits = []
+        self.win.h = float(island_pill.OPEN_H_BASE)
+        self.win.current_player = lambda: None
+        self.win.timer_end = None
+        self.win.dl_active = False
+        self.win.dl_phase = 0.5
+        self.win.dl_rate = 0.0
+        self.win.dl_name = None
+        self.win.dl_bytes = 0
+        self.win.dl_bar = lambda: (0.42, (0.35, 0.62, 1.0, 1.0), True)
+        self.win.retarget = lambda: None
+        self.win.queue_draw = lambda: None
+        self.win.get_mapped = lambda: False
+        self.win.dnd = False
+        self.win.awake_on = False
+
+    def _apply(self, wifi, bt):
+        win = self.win
+        if wifi:
+            win.wdev = object()
+            win.wifi_summary = lambda: (wifi["label"], wifi["color"])
+            win.wifi_level = lambda: 2
+            win.wifi_on = wifi["on"]
+            win.wifi_note = wifi["note"]
+        else:
+            win.wdev = None
+        if bt:
+            win.bt_powered = bt["on"]
+            win.bt_note = bt["note"]
+            win.bt_summary = lambda: (bt["label"], bt["color"])
+        else:
+            win.bt_powered = None
+
+    def _draw(self):
+        self.win.hits = []
+        surf = cairo.ImageSurface(cairo.FORMAT_ARGB32,
+                                  island_pill.WIN_W, island_pill.WIN_H)
+        cr = cairo.Context(surf)
+        self.win.draw_open(cr)
+        return surf
+
+    def _row_targets(self, fn):
+        left = (island_pill.WIN_W - island_pill.OPEN_W) / 2.0 + 90
+        y = (island_pill.TOP_MARGIN + island_pill.TAB_ROW_H
+             + island_pill.MUSIC_CARD_H + island_pill.HOME_GAP)
+        return [(x, yy, w, h) for x, yy, w, h, f in self.win.hits
+                if f == fn and abs(yy - y) < 0.01]
+
+    def test_four_tiles_when_both_hardware(self):
+        self._apply(dict(label="TP-Link_5G", color=(1, 1, 1, 1), on=True,
+                         note=False),
+                    dict(label="Bluetooth", color=(1, 1, 1, 1), on=True,
+                         note=False))
+        self._draw()
+        left = (island_pill.WIN_W - island_pill.OPEN_W) / 2.0 + 90
+        y = (island_pill.TOP_MARGIN + island_pill.TAB_ROW_H
+             + island_pill.MUSIC_CARD_H + island_pill.HOME_GAP)
+        wifi = self._row_targets(self.win.wifi_toggle)
+        bt = self._row_targets(self.win.bt_toggle)
+        dnd = self._row_targets(self.win.dnd_toggle)
+        ka = self._row_targets(self.win.keepawake_toggle)
+        self.assertEqual(len(wifi) + len(bt) + len(dnd) + len(ka), 4)
+        self.assertEqual(wifi[0], (left, y, 126.0, 40.0))
+        self.assertEqual(bt[0], (left + 134.0, y, 126.0, 40.0))
+        self.assertEqual(dnd[0], (left + 268.0, y, 40.0, 40.0))
+        self.assertEqual(ka[0], (left + 316.0, y, 40.0, 40.0))
+
+    def test_one_hardware_gives_260(self):
+        self._apply(dict(label="TP-Link_5G", color=(1, 1, 1, 1), on=True,
+                         note=False), None)
+        self._draw()
+        left = (island_pill.WIN_W - island_pill.OPEN_W) / 2.0 + 90
+        y = (island_pill.TOP_MARGIN + island_pill.TAB_ROW_H
+             + island_pill.MUSIC_CARD_H + island_pill.HOME_GAP)
+        wifi = self._row_targets(self.win.wifi_toggle)
+        self.assertEqual(wifi[0], (left, y, 260.0, 40.0))
+        self.assertEqual(len(self._row_targets(self.win.bt_toggle)), 0)
+        self.assertEqual(self._row_targets(self.win.dnd_toggle)[0],
+                         (left + 268.0, y, 40.0, 40.0))
+
+    def test_no_hardware_row_still_exists(self):
+        self._apply(None, None)
+        self._draw()
+        left = (island_pill.WIN_W - island_pill.OPEN_W) / 2.0 + 90
+        y = (island_pill.TOP_MARGIN + island_pill.TAB_ROW_H
+             + island_pill.MUSIC_CARD_H + island_pill.HOME_GAP)
+        self.assertEqual(len(self._row_targets(self.win.dnd_toggle)), 1)
+        self.assertEqual(len(self._row_targets(self.win.keepawake_toggle)), 1)
+        self.assertEqual(self._row_targets(self.win.dnd_toggle)[0],
+                         (left + 268.0, y, 40.0, 40.0))
+        self.assertEqual(self._row_targets(self.win.keepawake_toggle)[0],
+                         (left + 316.0, y, 40.0, 40.0))
+
+    def test_squares_paint_their_glyphs(self):
+        D = (1, 1, 1, 1)
+        self.win.dnd = True
+        self.win.awake_on = True
+        surf = self._draw()
+        data = bytes(surf.get_data())
+        stride = surf.get_stride()
+        left = (island_pill.WIN_W - island_pill.OPEN_W) / 2.0 + 90
+        y = (island_pill.TOP_MARGIN + island_pill.TAB_ROW_H
+             + island_pill.MUSIC_CARD_H + island_pill.HOME_GAP)
+
+        def ink(x0, y0, w, h):
+            n = 0
+            for yy in range(int(y0), int(y0 + h), 2):
+                row = data[yy * stride:(yy + 1) * stride]
+                for xx in range(int(x0), int(x0 + w), 2):
+                    if row[xx * 4 + 3] > 60:
+                        n += 1
+            return n
+        # the 40x40 squares only show the ~61-95 px glyph: sampled every 2
+        # pixels that lands around 15 hits per square
+        self.assertGreater(ink(left + 268, y, 40, 40), 10)   # moon on
+        self.assertGreater(ink(left + 316, y, 40, 40), 10)   # sun on
+        # off state: same glyphs, DIM tint
+        self.win.dnd = False
+        self.win.awake_on = False
+        surf = self._draw()
+        data = bytes(surf.get_data())
+        self.assertGreater(ink(left + 268, y, 40, 40), 10)
+        self.assertGreater(ink(left + 316, y, 40, 40), 10)
+
+
+class TestHomeHeights(unittest.TestCase):
+    """Heights on a machine with Wi-Fi or Bluetooth (this laptop) stay
+    exactly as they were; a machine with neither now gets the row too, so
+    its Home height is OPEN_H_BASE + ROW_CONN_H.  OPEN_H_MAX, OPEN_MIN_H
+    and the paint crossfade range stay consistent."""
+
+    def _win(self, hw):
+        win = island_pill.Island.__new__(island_pill.Island)
+        win.dl_active = False
+        win.has_conn = lambda: hw
+        win.open_tab = "Home"
+        return win
+
+    def test_home_height_with_hardware_unchanged(self):
+        self.assertEqual(self._win(True).open_h(),
+                         island_pill.OPEN_H_BASE + island_pill.ROW_CONN_H)
+
+    def test_home_height_without_hardware_gets_the_row(self):
+        self.assertEqual(self._win(False).open_h(),
+                         island_pill.OPEN_H_BASE + island_pill.ROW_CONN_H)
+
+    def test_constants_composition_unchanged(self):
+        self.assertEqual(island_pill.OPEN_H_MAX,
+                         island_pill.OPEN_H_BASE + island_pill.ROW_CONN_H
+                         + island_pill.ROW_DL_H)
+        self.assertEqual(island_pill.OPEN_MIN_H,
+                         min(island_pill.OPEN_H_BASE,
+                             island_pill.TAB_ROW_H + island_pill.SYSTEM_CONTENT_H,
+                             island_pill.TAB_ROW_H + island_pill.OPENCODE_CONTENT_H))
+        self.assertLessEqual(island_pill.OPEN_MIN_H,
+                             island_pill.OPEN_H_BASE + island_pill.ROW_CONN_H)
+
+
+class _FakeRes:
+    def __init__(self, value):
+        self._value = value
+
+
+class _FakeConn:
+    """Session-bus stand-in: records every D-Bus call and feeds the given
+    callback synchronously; `fail=True` makes call_finish raise."""
+
+    def __init__(self, test, calls, cookie, fail=False):
+        self.test = test
+        self.calls = calls
+        self.cookie = cookie
+        self.fail = fail
+
+    def call(self, bus_name, object_path, interface_name, method_name,
+             parameters, reply_type, flags, timeout_msec, cancellable,
+             callback, user_data=None):
+        # real Gio.DBusConnection.call positional signature
+        self.test.assertTrue(Gio.dbus_is_name(bus_name))
+        self.test.assertTrue(Gio.dbus_is_interface_name(interface_name))
+        self.test.assertTrue(Gio.dbus_is_member_name(method_name))
+        self.test.assertTrue(GLib.Variant.is_object_path(object_path))
+        self.test.assertEqual(bus_name, "org.gnome.SessionManager")
+        self.test.assertEqual(object_path, "/org/gnome/SessionManager")
+        self.test.assertEqual(interface_name, "org.gnome.SessionManager")
+        self.test.assertIn(method_name, ("Inhibit", "Uninhibit"))
+        self.calls.append((method_name, parameters))
+        if method_name == "Inhibit":
+            self.test.assertEqual(parameters.get_type_string(), "(susu)")
+            self.test.assertEqual(parameters.get_child_value(0).get_string(),
+                                  island_pill.KA_APP_ID)
+            self.test.assertEqual(parameters.get_child_value(3).get_uint32(),
+                                  island_pill.KA_FLAGS)
+        else:
+            self.test.assertEqual(parameters.get_type_string(), "(u)")
+            self.test.assertEqual(parameters.get_child_value(0).get_uint32(),
+                                  self.cookie)
+        if self.fail:
+            callback(self, None)
+        else:
+            callback(self, _FakeRes((self.cookie,)))
+
+    def call_finish(self, res):
+        if res is None:
+            raise GLib.Error("transport error")
+        return res._value
+
+
+class TestKeepAwake(unittest.TestCase):
+    """Keep Awake uses connection.call on the existing session bus: exactly
+    one Inhibit with app_id "island-pill" and flags 12 while turning on,
+    exactly one Uninhibit with the cookie while turning off, failures leave
+    the tile OFF, and a click during an in-flight call is ignored."""
+
+    def setUp(self):
+        self.win = island_pill.Island.__new__(island_pill.Island)
+        self.win.awake_on = False
+        self.win.awake_cookie = None
+        self.win.awake_conn = None
+        self.win.awake_pending = False
+        self.win.retarget = lambda: None
+        self.draws = []
+        self.win.queue_draw = lambda: self.draws.append(1)
+        self.calls = []
+        self.ready_cb = None
+        self.conn_fail = False
+        self.stderr = io.StringIO()
+        self.stderr_patch = mock.patch.object(sys, "stderr", self.stderr)
+        self.stderr_patch.start()
+        self.addCleanup(self.stderr_patch.stop)
+        patcher = mock.patch.object(island_pill, "Gio", self._make_gio())
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _make_gio(self):
+        calls = self.calls
+
+        class _FakeGio:
+            class BusType:
+                SESSION = "SESSION"
+
+            class DBusCallFlags:
+                NONE = 0
+
+            @staticmethod
+            def bus_get(bus_type, cancellable, cb):
+                calls.append(("bus_get", bus_type))
+                self.ready_cb = cb
+
+            @staticmethod
+            def bus_get_finish(res):
+                return _FakeConn(self, calls, 4242, fail=self.conn_fail)
+
+        return _FakeGio
+
+    def _drive_on(self):
+        self.win.keepawake_toggle()            # bus_get scheduled
+        self.assertEqual([c[0] for c in self.calls], ["bus_get"])
+        self.ready_cb(None, None)              # conn ready -> Inhibit call
+        self.assertEqual([c[0] for c in self.calls][1:], ["Inhibit"])
+
+    def test_inhibit_exactly_once_with_right_args(self):
+        self._drive_on()
+        self.assertEqual(self.win.awake_cookie, 4242)
+        self.assertTrue(self.win.awake_on)
+        self.assertFalse(self.win.awake_pending)
+        inhibits = [c for c in self.calls if c[0] == "Inhibit"]
+        self.assertEqual(len(inhibits), 1)
+        self.assertEqual(inhibits[0],
+                         ("Inhibit",
+                          GLib.Variant("(susu)",
+                                       (island_pill.KA_APP_ID, 0,
+                                        island_pill.KA_REASON,
+                                        island_pill.KA_FLAGS))))
+        self.assertEqual([c for c in self.calls if c[0] == "Uninhibit"], [])
+
+    def test_ka_constants(self):
+        self.assertEqual(island_pill.KA_BUS, "org.gnome.SessionManager")
+        self.assertNotEqual(island_pill.KA_BUS, island_pill.KA_APP_ID)
+
+    def test_uninhibit_exactly_once(self):
+        self._drive_on()
+        self.win.keepawake_toggle()            # off
+        self.assertIsNone(self.win.awake_cookie)
+        self.assertFalse(self.win.awake_on)
+        uninhibits = [c for c in self.calls if c[0] == "Uninhibit"]
+        self.assertEqual(len(uninhibits), 1)
+        self.assertEqual(uninhibits[0],
+                         ("Uninhibit", GLib.Variant("(u)", (4242,))))
+        self.assertFalse(self.win.awake_on)
+
+    def test_conn_call_failure_leaves_tile_off(self):
+        self.conn_fail = True
+        self._drive_on()
+        self.assertFalse(self.win.awake_on)
+        self.assertIsNone(self.win.awake_cookie)
+        self.assertFalse(self.win.awake_pending)
+
+    def test_ready_failure_leaves_tile_off(self):
+        island_pill.Gio = self._make_gio()
+        island_pill.Gio.bus_get_finish = lambda res: (_ for _ in ()).throw(
+            GLib.Error("no session bus"))
+        self.win.keepawake_toggle()
+        self.ready_cb(None, None)
+        self.assertFalse(self.win.awake_on)
+        self.assertIsNone(self.win.awake_cookie)
+        self.assertFalse(self.win.awake_pending)
+
+    def test_click_while_pending_ignored(self):
+        self.win.keepawake_toggle()            # bus scheduled, no ready yet
+        self.win.keepawake_toggle()            # must be ignored
+        self.assertEqual([c[0] for c in self.calls], ["bus_get"])
+
+    def test_error_reply_stays_off_and_retries(self):
+        self.conn_fail = True          # fake connection reports failure
+        self.win.keepawake_toggle()    # bus_get scheduled
+        self.ready_cb(None, None)      # Inhibit dispatched -> error reply
+        self.assertFalse(self.win.awake_on)
+        self.assertIsNone(self.win.awake_cookie)
+        self.assertFalse(self.win.awake_pending)   # not stuck pending
+        self.assertIn("island: keep awake:", self.stderr.getvalue())
+        # a second toggle is not ignored: it tries again
+        self.calls.clear()
+        self.conn_fail = False
+        self.win.keepawake_toggle()
+        self.ready_cb(None, None)
+        self.assertTrue(self.win.awake_on)
+        self.assertEqual(self.win.awake_cookie, 4242)
 
 
 if __name__ == "__main__":
