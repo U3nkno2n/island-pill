@@ -29,3 +29,8 @@ DOWNLOAD_DONE_PEEK = True # peek "Download finished" when a download of 20 MB or
 SHOW_WIFI = True          # Wi-Fi button in the open card, peek on connect / disconnect
 HOVER_ONLY = True         # keep the island visually quiet; reveal/expand content only on hover
 HOVER_ONLY_PEEKS = True   # allow brief peeks (battery, downloads, Wi-Fi, etc.) even in quiet mode
+DND_PASSTHRU = ("opencode-alert", "timer")  # peek kinds never silenced by Do Not Disturb
+KA_APP_ID = "island-pill"   # D-Bus app_id for the session inhibit (Keep Awake)
+KA_BUS = "org.gnome.SessionManager"   # destination service for session Inhibit
+KA_REASON = "Keep awake while enabled"
+KA_FLAGS = 12             # session Inhibit flags: 4 = suspend, 8 = idle/blank

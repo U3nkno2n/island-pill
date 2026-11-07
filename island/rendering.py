@@ -172,6 +172,46 @@ def draw_wifi_glyph(cr, cx, cy, color, level=3):
     cr.restore()
 
 
+def draw_dnd_glyph(cr, cx, cy, color, s=1.05):
+    """Do-Not-Disturb crescent moon, about 11 px tall at s=1."""
+    cr.save()
+    cr.set_source_rgba(*color)
+    # Crescent from two circles: outer disc (r1) and a bite disc centred at
+    # (bx, by).  Intersections are solved, so the two arcs join exactly.
+    r1, r2 = 5.0 * s, 4.2 * s
+    bx, by = 2.6 * s, -1.1 * s
+    d = math.hypot(bx, by)
+    a = (r1 * r1 - r2 * r2 + d * d) / (2.0 * d)
+    h = math.sqrt(max(0.0, r1 * r1 - a * a))
+    ux, uy = bx / d, by / d
+    x1, y1 = a * ux - h * uy, a * uy + h * ux
+    x2, y2 = a * ux + h * uy, a * uy - h * ux
+    cr.arc(cx, cy, r1, math.atan2(y1, x1), math.atan2(y2, x2))
+    cr.arc_negative(cx + bx, cy + by, r2,
+                    math.atan2(y2 - by, x2 - bx),
+                    math.atan2(y1 - by, x1 - bx))
+    cr.close_path()
+    cr.fill()
+    cr.restore()
+
+
+def draw_awake_glyph(cr, cx, cy, color, s=1.0):
+    """Keep-Awake sun (screen stays on), about 10 px wide at s=1."""
+    cr.save()
+    cr.set_source_rgba(*color)
+    cr.set_line_width(1.4 * s)
+    cr.set_line_cap(cairo.LINE_CAP_ROUND)
+    cr.arc(cx, cy, 2.1 * s, 0, 2 * math.pi)
+    cr.stroke()
+    for i in range(8):
+        a = i * math.pi / 4.0
+        dx, dy = math.cos(a), math.sin(a)
+        cr.move_to(cx + dx * 3.3 * s, cy + dy * 3.3 * s)
+        cr.line_to(cx + dx * 5.0 * s, cy + dy * 5.0 * s)
+    cr.stroke()
+    cr.restore()
+
+
 def draw_down_arrow(cr, cx, cy, color, s=1.0):
     """A downward arrow, about 9 px tall at s=1."""
     cr.save()

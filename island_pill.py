@@ -60,8 +60,10 @@ import cairo  # noqa: E402
 # names below are the live values for every host-side reader; mutating
 # island_pill.<name> at runtime keeps working for island_pill consumers.
 from island.settings import (  # noqa: E402
-    DOWNLOAD_DONE_PEEK, DOWNLOAD_MIN_KBPS, DOWNLOAD_NETWORK_FALLBACK,
-    FONT, HOVER_ONLY, HOVER_ONLY_PEEKS, HOVER_OPEN_DELAY_MS, HOUR24, LOW_BATTERY,
+    DND_PASSTHRU, DOWNLOAD_DONE_PEEK, DOWNLOAD_MIN_KBPS,
+    DOWNLOAD_NETWORK_FALLBACK, FONT, HOVER_ONLY, HOVER_ONLY_PEEKS,
+    HOVER_OPEN_DELAY_MS, HOUR24, KA_APP_ID, KA_BUS, KA_FLAGS, KA_REASON,
+    LOW_BATTERY,
     PEEK_SECONDS, SHOW_DOWNLOADS, SHOW_NOTIFICATIONS, SHOW_WIFI, STYLE,
     TIMER_PRESETS,
 )
@@ -88,6 +90,7 @@ HOME_GAP = 8                     # gap between stacked cards on Home
 HOME_CARD_PAD = 12               # inner padding inside every Home card
 MUSIC_CARD_H = 64                # music / clock card on Home
 TILE_H = 40                      # Wi-Fi / Bluetooth tile height
+TILE_SQ_W = 40                   # DND / Keep Awake icon-only squares
 DL_CARD_H = 48                   # download card on Home (only while downloading)
 HOME_PAD_B = 12                  # bottom padding after Home's last card
 OPEN_H_BASE = TAB_ROW_H + MUSIC_CARD_H + HOME_PAD_B   # Home base, incl. tab row
@@ -155,6 +158,7 @@ from island.rendering import (  # noqa: E402
     glyph_skip, glyph_pause, draw_bars, draw_battery, draw_clock_icon,
     draw_bt_glyph, draw_wifi_glyph, draw_down_arrow, progress_bar,
     indeterminate_bar, tab_pill, card, state_dot, CARD,
+    draw_dnd_glyph, draw_awake_glyph,
 )
 
 
@@ -326,6 +330,11 @@ class Island(Gtk.Window):
         self.charge_flash_id = 0
         self.peek = {}
         self.peek_on = False
+        self.dnd = False            # Do Not Disturb; memory-only, never persisted
+        self.awake_on = False       # Keep Awake tile state follows the inhibit
+        self.awake_cookie = None    # session Inhibit cookie while held
+        self.awake_conn = None      # session-bus connection, reused for Uninhibit
+        self.awake_pending = False  # an Inhibit call is in flight; block re-clicks
         self.hits = []
         self.open_tab = "Home"
         self._sec_warned = False
@@ -526,7 +535,9 @@ class Island(Gtk.Window):
 
     def open_h(self):
         if self.open_tab == "Home":
-            return (OPEN_H_BASE + (ROW_CONN_H if self.has_conn() else 0)
+            # The tile row is unconditional now (DND and Keep Awake always
+            # exist); Wi-Fi/Bluetooth tiles appear only with the hardware.
+            return (OPEN_H_BASE + ROW_CONN_H
                     + (ROW_DL_H if self.dl_active else 0))
         if self.open_tab == "System":
             return TAB_ROW_H + SYSTEM_CONTENT_H
@@ -612,6 +623,12 @@ class Island(Gtk.Window):
         self.queue_draw()
 
     def show_peek(self, kind, title, body="", secs=None, accent=None, app=""):
+        # Do Not Disturb: normal peeks are dropped (not queued).  The gate
+        # runs first so silence also applies while the expanded card is open
+        # and on the pending-peek promotion re-entry below; the DND state is
+        # never persisted.  Permission asks and the timer alert bypass it.
+        if getattr(self, "dnd", False) and kind not in DND_PASSTHRU:
+            return
         self.last_activity = time.monotonic()       # a visible event is activity
         if secs is None:
             secs = PEEK_SECONDS        # read at call time: hand-edit friendly
@@ -1048,6 +1065,89 @@ class Island(Gtk.Window):
             GLib.Variant("(ssv)", ("org.bluez.Adapter1", "Powered",
                                    GLib.Variant("b", not self.bt_powered))),
             None, Gio.DBusCallFlags.NO_AUTO_START, 3000, None, self.on_bt_set)
+
+    def dnd_toggle(self):
+        """Do Not Disturb: silent in memory only, so a restart can never
+        leave it on.  Permission asks and the timer alert stay visible
+        (DND_PASSTHRU); nothing else is stored."""
+        self.dnd = not self.dnd
+        self.retarget()
+        self.queue_draw()
+
+    def keepawake_toggle(self):
+        """Keep Awake: holds a GNOME session Inhibit while on, so neither
+        the screen blanks nor the laptop suspends from idle.  The cookie
+        comes from the session manager; any D-Bus failure leaves the tile
+        OFF.  On quit the process vanishes from the bus and cinnamon-session
+        prunes dead clients' inhibitors - no teardown code needed."""
+        if self.awake_cookie is not None:
+            self.keepawake_release()
+            return
+        if self.awake_pending:
+            return                        # an Inhibit is already in flight
+        self.awake_pending = True
+        try:
+            Gio.bus_get(Gio.BusType.SESSION, None, self._awake_conn_ready)
+        except Exception as e:
+            self._awake_fail(str(e))
+
+    def _awake_conn_ready(self, source, res):
+        try:
+            self.awake_conn = Gio.bus_get_finish(res)
+            self.awake_conn.call(KA_BUS, "/org/gnome/SessionManager",
+                                 "org.gnome.SessionManager", "Inhibit",
+                                 GLib.Variant("(susu)",
+                                              (KA_APP_ID, 0, KA_REASON,
+                                               KA_FLAGS)),
+                                 GLib.VariantType("(u)"),
+                                 Gio.DBusCallFlags.NONE, -1, None,
+                                 self._awake_inhibited)
+        except Exception as e:
+            self._awake_fail(str(e))
+
+    def _awake_inhibited(self, conn, res):
+        try:
+            self.awake_cookie = conn.call_finish(res)[0]
+            self.awake_pending = False
+            self.awake_on = True
+        except Exception as e:
+            self._awake_fail(str(e))
+            return
+        self.retarget()
+        self.queue_draw()
+
+    def _awake_fail(self, err=""):
+        if err:
+            print("island: keep awake:", err, file=sys.stderr)
+        self.awake_pending = False
+        self.awake_cookie = None
+        self.awake_on = False
+        self.retarget()
+        self.queue_draw()
+
+    def keepawake_release(self):
+        """Toggle off: drop the cookie.  The Uninhibit call is best-effort -
+        the state is cleared locally no matter what."""
+        cookie, self.awake_cookie = self.awake_cookie, None
+        self.awake_on = False
+        conn = self.awake_conn
+        self.retarget()
+        self.queue_draw()
+        if conn is None:
+            return
+        try:
+            conn.call(KA_BUS, "/org/gnome/SessionManager",
+                      "org.gnome.SessionManager", "Uninhibit",
+                      GLib.Variant("(u)", (cookie,)), None,
+                      Gio.DBusCallFlags.NONE, -1, None, self._awake_released)
+        except Exception as e:
+            print("island: keep awake:", e, file=sys.stderr)
+
+    def _awake_released(self, conn, res):
+        try:
+            conn.call_finish(res)
+        except Exception:
+            pass
 
     def on_bt_set(self, bus, res):
         try:
@@ -1847,32 +1947,47 @@ class Island(Gtk.Window):
             draw_text(cr, time.strftime("%A, %d %b"), right - HOME_CARD_PAD, by, 10.5, DIM,
                       align=2)
 
-        # Wi-Fi and Bluetooth tiles (tap to switch on / off), side by side
+        # Wi-Fi and Bluetooth tiles (hardware only) with the fixed
+        # Do-Not-Disturb and Keep Awake squares at the right end.  The row
+        # always exists now, so Home always reserves ROW_CONN_H.
         y = oy + MUSIC_CARD_H
-        if self.has_conn():
-            tiles = []
-            if self.wdev is not None:
-                label, color = self.wifi_summary()
-                on = bool(self.wifi_on) and not self.wifi_note
-                lvl = self.wifi_level()
-                tiles.append((label, color, on,
-                              lambda c, ix, iy, col: draw_wifi_glyph(c, ix, iy, col, lvl),
-                              self.wifi_toggle))
-            if self.bt_powered is not None:
-                label, color = self.bt_summary()
-                on = bool(self.bt_powered) and not self.bt_note
-                tiles.append((label, color, on, draw_bt_glyph, self.bt_toggle))
-            if tiles:
-                tt = y + HOME_GAP
-                tx = left
-                if len(tiles) == 1:
-                    tw = right - left             # a lone tile takes the full width
-                else:
-                    tw = (right - left - HOME_GAP) / 2.0
-                for label, color, on, icon, fn in tiles:
-                    self._tile(cr, tx, tt, tw, TILE_H, label, color, on, icon, fn)
-                    tx += tw + HOME_GAP
-                y = tt + TILE_H
+        tiles = []
+        if getattr(self, "wdev", None) is not None:
+            label, color = self.wifi_summary()
+            on = bool(self.wifi_on) and not self.wifi_note
+            lvl = self.wifi_level()
+            tiles.append((label, color, on,
+                          lambda c, ix, iy, col: draw_wifi_glyph(c, ix, iy, col, lvl),
+                          self.wifi_toggle))
+        if getattr(self, "bt_powered", None) is not None:
+            label, color = self.bt_summary()
+            on = bool(self.bt_powered) and not self.bt_note
+            tiles.append((label, color, on, draw_bt_glyph, self.bt_toggle))
+        tt = y + HOME_GAP
+        span = right - left
+        sq_w = TILE_SQ_W + HOME_GAP                       # one fixed square slot
+        if len(tiles) == 2:
+            tw = (span - 2 * TILE_SQ_W - 3 * HOME_GAP) / 2.0        # 126 wide
+            xs = [left, left + tw + HOME_GAP]
+        elif len(tiles) == 1:
+            tw = span - 2 * TILE_SQ_W - 2 * HOME_GAP                # 260 wide
+            xs = [left]
+        else:
+            tw, xs = 0.0, []
+        for t, tx in zip(tiles, xs):
+            label, color, on, icon, fn = t
+            self._tile(cr, tx, tt, tw, TILE_H, label, color, on, icon, fn)
+        # the two fixed squares at the right end: DND (moon) and Keep Awake (eye)
+        sx = right - (2 * TILE_SQ_W + HOME_GAP)          # flush with `right`
+        square = [("", draw_dnd_glyph, self.dnd_toggle,
+                   getattr(self, "dnd", False)),
+                  ("", draw_awake_glyph, self.keepawake_toggle,
+                   getattr(self, "awake_on", False))]
+        sq_w = TILE_SQ_W + HOME_GAP
+        for i, (label, glyph, fn, on) in enumerate(square):
+            self._tile(cr, sx + i * sq_w, tt, TILE_SQ_W, TILE_H, label,
+                       BLUE if on else DIM, on, glyph, fn)
+        y = tt + TILE_H
 
         # download card, only while one is running
         if self.dl_active:
