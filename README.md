@@ -4,17 +4,29 @@ A lightweight, GTK 3 Dynamic Island-style desktop widget for Linux Mint Cinnamon
 
 ## Features
 
-- Floating pill at the top centre, with clock/timer and active media title
-- MPRIS media metadata and controls
-- CPU, RAM, temperature and battery information
-- Small countdown timers
-- Wi-Fi and Bluetooth status/toggles where the relevant desktop services are available
-- Optional notification peeks
-- Download row with speed and an indeterminate progress animation when a reliable total is unavailable
-- Hover-to-open controls (5 seconds by default), click-to-open, and right-click-to-quit
-- OpenCode integration: activity peeks (started, working, done, failed, cancelled)
-  and permission requests with functional Allow / Deny controls that reach the
-  correct OpenCode request via the Unix socket bridge
+- Hides in the top-edge notch; hovering reveals the compact pill; clicking
+  opens the tabbed card (Home / OpenCode / System); clicking again or moving
+  the pointer away closes it
+- Clock and timer in the pill
+- Music via MPRIS (local players and Firefox), with previous / play-pause /
+  next controls
+- Download progress bar only while something downloads, plus a "download
+  finished" peek
+- Wi-Fi and Bluetooth status and toggles
+- OpenCode integration: activity peeks, a live session list in the OpenCode
+  tab, and permission peeks with Allow / Deny that answer OpenCode
+- Mascot with moods; its eyes follow the pointer only while it is over the
+  island; the mascot tile in the open card changes face when clicked
+- Do Not Disturb moon tile: silences only the island's own peeks; it does not
+  hide Cinnamon's desktop notification popups. OpenCode permission alerts and
+  timer alerts still show on the island.
+- Keep Awake sun tile: holds a session inhibit so the screen stays on and the
+  laptop does not suspend from idle; released when turned off or the island
+  quits
+- Optional notification peeks: the island shows a short peek when a desktop
+  notification arrives. The setting SHOW_NOTIFICATIONS in island/settings.py
+  switches this off.
+- Battery, CPU/RAM usage, and temperature
 
 ## Download detection and false positives
 
@@ -39,19 +51,23 @@ Keep `island_pill.py`, `install.sh`, and `README.md` in the same folder, then ru
 bash install.sh
 ```
 
-The installer checks GTK 3 and Cairo dependencies, copies the app into `~/.local/share/island-pill/`, creates a user autostart entry, and starts it. It does not need root privileges. If dependencies are missing, Linux Mint/Ubuntu can install them with:
+The installer checks GTK 3 and Cairo dependencies, copies the app into
+`~/.local/share/island-pill/`, installs the OpenCode plugin into
+`~/.config/opencode/plugins/`, creates a user autostart entry, and starts it.
+Requirements: Linux Mint/Cinnamon on X11, python3-gi, gir1.2-gtk-3.0,
+python3-gi-cairo. It does not need root privileges. If dependencies are missing, Linux Mint/Ubuntu can install them with:
 
 ```bash
 sudo apt install python3-gi gir1.2-gtk-3.0 python3-gi-cairo
 ```
-
 Uninstall the app with:
 
 ```bash
 bash install.sh --uninstall
 ```
 
-This removes Island Pill's installed app, autostart entry, and log directory. It does not remove system packages or unrelated files.
+This removes Island Pill's installed app, autostart entry, log directory, and
+the OpenCode plugin. It does not remove system packages or unrelated files.
 
 ## Troubleshooting
 
@@ -60,6 +76,9 @@ The log is written to:
 ```text
 ~/.local/state/island-pill/island-pill.log
 ```
+
+At each start the previous log is rotated to `island-pill.log.1` and a fresh
+log is appended, so the last run's log is preserved as crash evidence.
 
 To inspect it:
 
@@ -107,4 +126,5 @@ requests are tracked independently.
 
 ## Resource use
 
-The app uses GTK 3 and Cairo directly. Download monitoring samples `/proc/net/dev` every 0.5 seconds when enabled; it does not need that sample loop when `SHOW_DOWNLOADS = False`. Rendering animation runs only while needed. Actual memory use depends on the desktop session, loaded GTK libraries, and hardware.
+The app uses GTK 3 and Cairo directly. Download monitoring samples `/proc/net/dev` every 0.5 seconds when enabled; it does not need that sample loop when `SHOW_DOWNLOADS = False`. Rendering animation runs only while needed. Actual memory use is about 25 MB RSS on a typical session, depending on the
+desktop session, loaded GTK libraries, and hardware.

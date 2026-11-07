@@ -13,8 +13,10 @@ HERE="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 usage() {
     cat <<EOF
 Island Pill installer
-  bash install.sh             Install/update and start Island Pill
-  bash install.sh --uninstall Stop it and remove its installed files
+  bash install.sh             Install/update and start Island Pill (also
+                                installs the OpenCode plugin)
+  bash install.sh --uninstall Stop it and remove its installed files and
+                                the OpenCode plugin
   bash install.sh --help      Show this help
 
 Logs: $LOG
@@ -48,8 +50,10 @@ case "${1:-}" in
     --uninstall)
         stop_instance || true
         rm -f -- "$DESKTOP"
+        rm -f -- "$HOME/.config/opencode/plugins/island-pill-notify.js"
         rm -rf -- "$DIR" "$STATE_DIR"
         echo "Island Pill removed."
+        echo "The OpenCode plugin was removed."
         echo "The GTK/Python system packages were left untouched."
         exit 0
         ;;
@@ -83,6 +87,16 @@ stop_instance || old_still_running=1
 mkdir -p -- "$DIR" "$AUTOSTART_DIR" "$STATE_DIR"
 install -m 0755 "$HERE/island_pill.py" "$DIR/island_pill.py"
 install -m 0644 "$HERE/island_pill_opencode_bridge.py" "$DIR/island_pill_opencode_bridge.py"
+
+# Install the OpenCode plugin into the global plugins folder (create it if
+# missing). Only the plugin file itself is copied.
+PLUGIN_DIR="$HOME/.config/opencode/plugins"
+PLUGIN_FILE="$PLUGIN_DIR/island-pill-notify.js"
+mkdir -p -- "$PLUGIN_DIR"
+cp -f -- "$HERE/island-pill-notify.js" "$PLUGIN_FILE"
+chmod 0644 -- "$PLUGIN_FILE"
+echo "Plugin: $PLUGIN_FILE"
+
 mkdir -p -- "$DIR/island"
 cp -a -- "$HERE/island/." "$DIR/island/"
 
@@ -90,6 +104,9 @@ cp -a -- "$HERE/island/." "$DIR/island/"
 cat > "$DIR/run.sh" <<EOF
 #!/usr/bin/env bash
 mkdir -p "$STATE_DIR"
+if [[ -f "$LOG" ]]; then
+    mv -f -- "$LOG" "$LOG.1"
+fi
 exec /usr/bin/python3 "$DIR/island_pill.py" >> "$LOG" 2>&1
 EOF
 chmod 0755 "$DIR/run.sh"
