@@ -1,8 +1,6 @@
 """Capped in-memory event feed for Island Pill.
 
-Stage 2 seam module, dormant by design: documented by
-docs/phase1/04-product-architecture.md (§3 module map lists history.py as
-"capped in-memory feed"; §6 describes a capped ring, e.g. 200 entries,
+Stage 2 seam module, dormant by design: a capped ring (e.g. 200 entries,
 with history.jsonl persistence). Later stages (the agent/event feed)
 append to it. Wired to nothing in this stage — no behaviour change.
 
