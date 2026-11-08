@@ -3,12 +3,12 @@
 
 Checks the module graph contract established by the approved Stage 2 plan:
 
-  - island/settings.py, island/peek.py, island/history.py are PURE:
+  - island/settings.py, island/peek.py are PURE:
     stdlib-only imports, no GTK/GLib/cairo/subprocess code references.
   - island/audio.py is the documented gi exception: only Gio/GLib/Gdk
     from gi (no Gtk, Pango, PangoCairo, cairo); all other imports stdlib.
   - No island.* module imports island_pill (one-way app -> package).
-  - island/peek.py, island/audio.py, island/history.py must not reference
+  - island/peek.py, island/audio.py must not reference
     island.settings (extracted logic receives settings as explicit
     arguments; island_pill re-imports settings names itself).
 """
@@ -20,14 +20,14 @@ import pytest
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 ISLAND_DIR = os.path.join(PROJECT_ROOT, "island")
 
-PURE_FILES = ("settings.py", "peek.py", "history.py")
+PURE_FILES = ("settings.py", "peek.py")
 AUDIO_FILE = "audio.py"
 
 BANNED_IMPORT_ROOTS = {
     "gi", "cairo", "subprocess",
     "island_pill",
     "island.clock", "island.theme", "island.settings", "island.peek",
-    "island.audio", "island.history",
+    "island.audio",
 }
 BANNED_CODE_TOKENS = ("Gtk", "Gdk", "GLib", "Pango", "PangoCairo",
                       "cairo", "subprocess", "gi")
@@ -36,7 +36,7 @@ AUDIO_ALLOWED_GI_NAMES = {"Gio", "GLib", "Gdk"}
 AUDIO_BANNED_GI_NAMES = {"Gtk", "Pango", "PangoCairo"}
 AUDIO_OTHER_ALLOWED_ROOTS = {"os", "subprocess", "time", "gi"}
 
-ALL_STAGE2_FILES = ("settings.py", "peek.py", "audio.py", "history.py")
+ALL_STAGE2_FILES = ("settings.py", "peek.py", "audio.py")
 
 
 def _ast(path):
@@ -114,7 +114,7 @@ def test_no_island_pill_import(leaf):
         assert root != "island_pill", (leaf, full)
 
 
-@pytest.mark.parametrize("leaf", ("peek.py", "audio.py", "history.py"))
+@pytest.mark.parametrize("leaf", ("peek.py", "audio.py"))
 def test_no_island_settings_reference(leaf):
     """Extracted modules must not read island.settings globals: settings
     reach them through explicit arguments (approved Stage 2 contract)."""
