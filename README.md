@@ -86,6 +86,10 @@ To inspect it:
 tail -n 100 ~/.local/state/island-pill/island-pill.log
 ```
 
+To verify OpenCode can reach the island (socket connection and the island logging
+the event), run `bash tools/selftest.sh` — the visible peek itself must be
+confirmed by eye.
+
 The widget is designed for Cinnamon on X11. Wayland compositors may restrict the transparent always-on-top window behavior. Right-click the pill to quit; the next login will launch it again unless you disable/remove the autostart entry.
 
 ## Settings
